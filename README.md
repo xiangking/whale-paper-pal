@@ -147,6 +147,14 @@ WhalePaper 离不开每一位参与设计、开发和完善项目的人。
 - 希望直接参与开发，可以发起 [Pull Request](../../pulls)，或先在 Issue 中介绍你的想法。
 - 想了解 Datawhale 的其他开源项目，或希望发起新项目，可以阅读 [Datawhale 开源项目指南](https://github.com/datawhalechina/DOPMC/blob/main/GUIDE.md)。
 
+### 加入讨论群
+
+欢迎加入 WhalePaper 工具技术讨论与内测群，交流使用体验、功能想法和版本反馈。二维码有效期有限，失效后会在项目中更新。
+
+<p align="center">
+  <img src="assets/readme/community-qr.jpg" alt="WhalePaper 工具技术讨论与内测群二维码" width="300">
+</p>
+
 <p align="center">
   <strong>关注 Datawhale</strong><br>
   <sub>扫描二维码获取开源项目动态</sub><br><br>

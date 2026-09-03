@@ -147,6 +147,14 @@ Code is only one way to help. UI design, product feedback, documentation, transl
 - To contribute code, open a [Pull Request](../../pulls), or describe your idea in an Issue first.
 - To explore other Datawhale projects or propose a new one, see the [Datawhale Open Source Project Guide](https://github.com/datawhalechina/DOPMC/blob/main/GUIDE.md).
 
+### Join the discussion group
+
+Join the WhalePaper technical discussion and beta-testing group to share feedback, feature ideas, and questions. The QR code is time-limited and will be replaced in the repository when it expires.
+
+<p align="center">
+  <img src="assets/readme/community-qr.jpg" alt="WhalePaper technical discussion and beta-testing group QR code" width="300">
+</p>
+
 <p align="center">
   <strong>Follow Datawhale</strong><br>
   <sub>Scan the QR code for open-source project updates</sub><br><br>
