@@ -147,19 +147,22 @@ Code is only one way to help. UI design, product feedback, documentation, transl
 - To contribute code, open a [Pull Request](../../pulls), or describe your idea in an Issue first.
 - To explore other Datawhale projects or propose a new one, see the [Datawhale Open Source Project Guide](https://github.com/datawhalechina/DOPMC/blob/main/GUIDE.md).
 
-### Join the discussion group
-
 Join the WhalePaper technical discussion and beta-testing group to share feedback, feature ideas, and questions. The QR code is time-limited and will be replaced in the repository when it expires.
 
-<p align="center">
-  <img src="assets/readme/community-qr.jpg" alt="WhalePaper technical discussion and beta-testing group QR code" width="300">
-</p>
-
-<p align="center">
-  <strong>Follow Datawhale</strong><br>
-  <sub>Scan the QR code for open-source project updates</sub><br><br>
-  <img src="https://raw.githubusercontent.com/datawhalechina/pumpkin-book/master/res/qrcode.jpeg" alt="Datawhale WeChat official account QR code" width="180" height="180">
-</p>
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <strong>Join the WhalePaper group</strong><br>
+      <sub>Technical discussion, beta feedback, and releases</sub><br><br>
+      <img src="assets/readme/community-qr.jpg" alt="WhalePaper technical discussion and beta-testing group QR code" width="240">
+    </td>
+    <td align="center" width="50%">
+      <strong>Follow Datawhale</strong><br>
+      <sub>Scan the QR code for open-source project updates</sub><br><br>
+      <img src="https://raw.githubusercontent.com/datawhalechina/pumpkin-book/master/res/qrcode.jpeg" alt="Datawhale WeChat official account QR code" width="180" height="180">
+    </td>
+  </tr>
+</table>
 
 ## Developer information
 
