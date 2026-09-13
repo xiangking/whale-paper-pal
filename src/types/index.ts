@@ -271,7 +271,7 @@ export type CitationCard = {
   rawReference?: string;
   paperId?: string;
   openAccessPdf?: string;
-  source?: "manual" | "pdf-reference" | "semantic-scholar" | "moonlight" | "openalex" | "crossref" | "huggingface";
+  source?: "manual" | "pdf-reference" | "semantic-scholar" | "moonlight" | "openalex" | "crossref" | "huggingface" | "arxiv";
   saved?: boolean;
   inLibrary?: boolean;
   reasonCited?: string;

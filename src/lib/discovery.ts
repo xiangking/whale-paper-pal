@@ -2,7 +2,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import type { DocumentLibraryEntry } from "../types";
 import { readBrandedStorage } from "./brand-storage";
 
-export type DiscoverySource = "moonlight" | "semantic-scholar" | "openalex" | "huggingface";
+export type DiscoverySource = "moonlight" | "semantic-scholar" | "openalex" | "huggingface" | "arxiv";
 
 export type DiscoveryPaper = {
   slug: string;
@@ -94,6 +94,7 @@ const DAILY_CACHE_KEY = "whalepaper.huggingface-daily.v1";
 const TRENDING_CACHE_KEY = "whalepaper.moonlight-trending.v1";
 const DAILY_CACHE_TTL = 6 * 60 * 60 * 1000;
 const TRENDING_CACHE_TTL = 30 * 60 * 1000;
+const ARXIV_API = "https://export.arxiv.org/api/query";
 const relatedRequests = new Map<string, Promise<DiscoveryPaper[]>>();
 let popularRequest: Promise<DiscoveryPaper[]> | null = null;
 let dailyRequest: Promise<DiscoveryPaper[]> | null = null;
@@ -336,6 +337,28 @@ async function loadOpenAlexRelated(title: string): Promise<DiscoveryPaper[]> {
     if (!paper || normalizeTitle(paper.title) === normalizeTitle(title)) return [];
     return [paper];
   });
+}
+
+async function loadArxivSearch(query: string): Promise<DiscoveryPaper[]> {
+  const url = `${ARXIV_API}?search_query=all:${encodeURIComponent(query)}&start=0&max_results=20&sortBy=relevance`;
+  const response = await fetch(url, { headers: { Accept: "application/atom+xml" } });
+  if (!response.ok) throw new Error(`arXiv 返回 ${response.status}`);
+  const xml = await response.text();
+  return [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].flatMap((match) => {
+    const block = match[1];
+    const read = (tag: string) => (block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`))?.[1] || "").replace(/<!\[CDATA\[|\]\]>/g, "").trim();
+    const id = read("id").split("/").pop() || "";
+    const title = read("title").replace(/\s+/g, " ");
+    if (!id || !title) return [];
+    const authors = [...block.matchAll(/<author>[\s\S]*?<name>([\s\S]*?)<\/name>[\s\S]*?<\/author>/g)].map((m) => clean(m[1]));
+    const summary = clean(read("summary"));
+    return [{ slug: `arxiv-${id}`, title, authors, url: `https://arxiv.org/abs/${id}`, pdfUrl: `https://arxiv.org/pdf/${id}`, summary: shortenedSummary(summary), categories: ["arXiv"], publishedDate: read("published"), source: "arxiv", matchScore: stableMatchScore(`arxiv-${id}`) } satisfies DiscoveryPaper];
+  });
+}
+
+export async function searchPapers(query: string): Promise<DiscoveryPaper[]> {
+  const requests = await Promise.allSettled([loadArxivSearch(query), loadOpenAlexRelated(query), loadSemanticScholarRelated(query, "")]);
+  return mergeRelatedPapers("", requests.flatMap((r) => r.status === "fulfilled" ? [r.value] : []));
 }
 
 async function loadSemanticScholarRelated(title: string, apiKey: string): Promise<DiscoveryPaper[]> {

@@ -26,6 +26,7 @@ import {
   loadDiscoveryFeed,
   type DiscoveryFeed,
   type DiscoveryPaper,
+  searchPapers,
 } from "../lib/discovery";
 import { HomeNavigation, type HomeMode } from "./HomeNavigation";
 
@@ -64,6 +65,8 @@ export function DiscoveryLibrary({ entries, onNavigate, onToggleSavedPaper, onOp
   const [error, setError] = useState("");
   const [actionError, setActionError] = useState("");
   const [openingPaperSlug, setOpeningPaperSlug] = useState("");
+  const [searchResults, setSearchResults] = useState<DiscoveryPaper[] | null>(null);
+  const [searching, setSearching] = useState(false);
 
   const openExternalResource = async (url: string) => {
     setActionError("");
@@ -101,10 +104,19 @@ export function DiscoveryLibrary({ entries, onNavigate, onToggleSavedPaper, onOp
   };
 
   useEffect(() => { void refresh(); }, []);
+  useEffect(() => {
+    const value = query.trim();
+    if (!value) { setSearchResults(null); return; }
+    const timer = window.setTimeout(() => {
+      setSearching(true);
+      void searchPapers(value).then(setSearchResults).catch(() => setSearchResults([])).finally(() => setSearching(false));
+    }, 450);
+    return () => window.clearTimeout(timer);
+  }, [query]);
 
   const savedIds = useMemo(() => new Set(entries.map((entry) => entry.id)), [entries]);
   const personalPapers = useMemo(() => buildPersonalRecommendations(feed.popular, entries), [feed.popular, entries]);
-  const activePapers = mode === "latest" ? feed.latest : mode === "popular" ? feed.popular : personalPapers;
+  const activePapers = searchResults !== null ? searchResults : mode === "latest" ? feed.latest : mode === "popular" ? feed.popular : personalPapers;
   const visiblePapers = useMemo(() => activePapers.filter((paper) => paperMatches(paper, query)), [activePapers, query]);
   const selectedPaper = visiblePapers.find((paper) => paper.slug === selectedSlug) || visiblePapers[0];
   const modeTitle = mode === "latest" ? "最新论文" : mode === "popular" ? "趋势热门" : "为你推荐";
@@ -147,7 +159,7 @@ export function DiscoveryLibrary({ entries, onNavigate, onToggleSavedPaper, onOp
             <header><span>{query ? `${visiblePapers.length} 个搜索结果` : modeTitle}</span><small>{modeDescription}</small></header>
             <div className="discovery-paper-scroll">
               {loading && !feed.latest.length && !feed.popular.length && Array.from({ length: 7 }, (_, index) => <div className="discovery-paper-skeleton" key={index}><i /><i /><i /></div>)}
-              {!loading && !visiblePapers.length && <div className="discovery-library-empty"><Sparkles size={28} /><strong>{query ? "没有匹配的论文" : mode === "personal" ? "论文库中还没有足够的兴趣记录" : "暂时没有论文"}</strong></div>}
+              {(searching || (!loading && !visiblePapers.length)) && <div className="discovery-library-empty"><Sparkles size={28} /><strong>{searching ? "正在搜索 arXiv、Semantic Scholar 和 OpenAlex…" : query ? "没有匹配的论文" : mode === "personal" ? "论文库中还没有足够的兴趣记录" : "暂时没有论文"}</strong></div>}
               {visiblePapers.map((paper, index) => {
                 const saved = savedIds.has(discoveryLibraryId(paper));
                 return (
