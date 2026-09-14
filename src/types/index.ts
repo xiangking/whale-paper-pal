@@ -229,7 +229,7 @@ export type PaperReviewPoint = {
   suggestion?: string;
 };
 
-export type PaperReview = {
+export type LegacyPaperReview = {
   executiveSummary: string;
   paperType: string;
   researchQuestion: string;
@@ -242,6 +242,14 @@ export type PaperReview = {
   literaturePositioning: string;
   takeaways: string[];
 };
+
+export type MarkdownPaperReview = {
+  overviewMarkdown: string;
+  methodMarkdown: string;
+  analysisMarkdown: string;
+};
+
+export type PaperReview = LegacyPaperReview | MarkdownPaperReview;
 
 export type PaperInsights = {
   review: PaperReview | null;

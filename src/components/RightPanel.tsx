@@ -162,6 +162,7 @@ type RightPanelProps = {
 type CitationTab = "saved" | "references" | "cited-by";
 type LoadState = "idle" | "loading" | "ready" | "error";
 type AssistantSection = "overview" | "method" | "analysis" | "discussion";
+type ReviewSection = Exclude<AssistantSection, "discussion">;
 type DiscussionRequest = { context: AssistantContext; prefixMessages: ChatMessage[] };
 
 function PanelEmpty({ icon, title, body }: { icon: React.ReactNode; title: string; body: string }) {
@@ -338,41 +339,51 @@ function buildDeferredPaperContext(
   )).join("\n\n");
 }
 
-function normalizePaperReview(value: unknown): PaperReview {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("模型没有返回有效的论文解读。");
-  const source = value as Record<string, unknown>;
-  const text = (input: unknown) => typeof input === "string" ? input.trim() : "";
-  const textList = (input: unknown) => Array.isArray(input) ? input.map(text).filter(Boolean).slice(0, 8) : [];
-  const points = (input: unknown) => Array.isArray(input) ? input.flatMap((item) => {
-    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
-    const point = item as Record<string, unknown>;
-    const title = text(point.title);
-    const evidence = text(point.evidence);
-    const significance = text(point.significance);
-    if (!title || !evidence || !significance) return [];
-    const suggestion = text(point.suggestion);
-    return [{ title, evidence, significance, ...(suggestion ? { suggestion } : {}) }];
-  }).slice(0, 6) : [];
-  const review: PaperReview = {
-    executiveSummary: text(source.executiveSummary),
-    paperType: text(source.paperType),
-    researchQuestion: text(source.researchQuestion),
-    contributions: textList(source.contributions),
-    methodologySummary: text(source.methodologySummary),
-    experimentalEvidence: text(source.experimentalEvidence),
-    strengths: points(source.strengths),
-    weaknesses: points(source.weaknesses),
-    reproducibility: text(source.reproducibility),
-    literaturePositioning: text(source.literaturePositioning),
-    takeaways: textList(source.takeaways),
-  };
-  if (!review.executiveSummary || !review.researchQuestion || !review.contributions.length || !review.methodologySummary || !review.experimentalEvidence || review.strengths.length < 2 || review.weaknesses.length < 2 || !review.reproducibility || !review.takeaways.length) {
-    throw new Error("论文解读内容不完整，请重新生成。");
-  }
-  return review;
+function isMarkdownPaperReview(review: PaperReview): review is Extract<PaperReview, { overviewMarkdown: string }> {
+  return "overviewMarkdown" in review;
+}
+
+function emptyMarkdownPaperReview(): Extract<PaperReview, { overviewMarkdown: string }> {
+  return { overviewMarkdown: "", methodMarkdown: "", analysisMarkdown: "" };
+}
+
+const REVIEW_SECTION_LABELS: Record<ReviewSection, string> = {
+  overview: "概览",
+  method: "方法与实验",
+  analysis: "评析",
+};
+
+const REVIEW_SECTION_REQUIREMENTS: Record<ReviewSection, string> = {
+  overview: [
+    "使用以下二级标题：## 论文类型、## 摘要、## 研究问题、## 核心贡献、## 阅读结论。",
+    "核心贡献列出 2–5 项；阅读结论列出 3–6 项，并说明适用条件和边界。",
+  ].join("\n"),
+  method: [
+    "使用以下二级标题：## 方法解读、## 实验与证据、## 可复现性。",
+    "方法部分说明关键机制、输入输出和重要假设；实验部分覆盖数据、基线、指标、主要结果、消融或论证依据。",
+  ].join("\n"),
+  analysis: [
+    "使用以下二级标题：## 优点、## 局限与注意事项、## 文献定位。",
+    "优点和局限各给出 2–4 项，每项使用三级标题，并分别说明论文内依据及其影响；局限可补充使用建议。",
+  ].join("\n"),
+};
+
+function buildReviewSectionPrompt(
+  section: ReviewSection,
+  title: string,
+  author: string,
+  customPrompt: string,
+): string {
+  return `${personalizedPrompt(AI_FEATURE_PROMPTS.review, customPrompt)}\n\n论文标题：${title}\n作者信息：${author || "PDF 未提供"}\n\n本次只生成“${REVIEW_SECTION_LABELS[section]}”部分。${REVIEW_SECTION_REQUIREMENTS[section]}\n直接返回 Markdown 正文，不要返回 JSON，不要使用代码围栏，也不要输出本部分之外的内容。`;
 }
 
 function PaperReviewView({ review, view }: { review: PaperReview; view: Exclude<AssistantSection, "discussion"> }) {
+  if (isMarkdownPaperReview(review)) {
+    const content = view === "overview" ? review.overviewMarkdown
+      : view === "method" ? review.methodMarkdown
+        : review.analysisMarkdown;
+    return content ? <MarkdownContent className="paper-review" content={content} /> : <p className="assistant-section-placeholder">这一部分尚未生成。</p>;
+  }
   return (
     <div className="paper-review">
       {view === "overview" && <>
@@ -396,6 +407,11 @@ function PaperReviewView({ review, view }: { review: PaperReview; view: Exclude<
 }
 
 function paperReviewSectionText(review: PaperReview, section: Exclude<AssistantSection, "discussion">): string {
+  if (isMarkdownPaperReview(review)) {
+    return section === "overview" ? review.overviewMarkdown
+      : section === "method" ? review.methodMarkdown
+        : review.analysisMarkdown;
+  }
   if (section === "overview") return [
     `## 摘要\n\n${review.executiveSummary}`,
     `## 研究问题\n\n${review.researchQuestion}`,
@@ -459,7 +475,7 @@ export function RightPanel(props: RightPanelProps) {
   const [citationError, setCitationError] = useState("");
   const [showMetadataKeyPrompt, setShowMetadataKeyPrompt] = useState(false);
   const [insightError, setInsightError] = useState("");
-  const [insightPending, setInsightPending] = useState<"review" | null>(null);
+  const [insightPending, setInsightPending] = useState<ReviewSection | "all" | null>(null);
   const [assistantSections, setAssistantSections] = useState<Record<AssistantSection, boolean>>({ overview: true, method: true, analysis: true, discussion: true });
   const [expandedAssistantContent, setExpandedAssistantContent] = useState<Record<Exclude<AssistantSection, "discussion">, boolean>>({ overview: false, method: false, analysis: false });
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
@@ -692,14 +708,14 @@ export function RightPanel(props: RightPanelProps) {
       {
         id: "paper-session-review-response",
         role: "assistant",
-        content: props.workspace.insights.sessionResponse || JSON.stringify(review),
+        content: props.workspace.insights.sessionResponse || createPaperReviewMarkdown(review),
       },
     ] : [];
     const relatedPaperContext = selectedReferenceIds.flatMap((id) => {
       const paper = props.libraryEntries.find((entry) => entry.id === id);
       if (!paper) return [];
       const review = loadWorkspace(id).insights.review;
-      return [`[参考论文]\n标题：${paper.title}\n作者：${paper.author || "未知"}${review ? `\n已有解读：${JSON.stringify(review)}` : ""}`];
+      return [`[参考论文]\n标题：${paper.title}\n作者：${paper.author || "未知"}${review ? `\n已有解读：\n${createPaperReviewMarkdown(review)}` : ""}`];
     }).join("\n\n");
     const turnContext = [
       deferredPages ? `[本轮要求的参考文献或补充材料]\n${deferredPages}` : "",
@@ -812,33 +828,67 @@ export function RightPanel(props: RightPanelProps) {
     mime,
   );
 
-  const generateInsight = async () => {
+  const generateInsight = async (targetSection?: ReviewSection) => {
     if (!initialPaperContext.trim() || pending) return;
+    const sections: ReviewSection[] = targetSection ? [targetSection] : ["overview", "method", "analysis"];
+    const prompts = sections.map((section) => ({
+      section,
+      prompt: buildReviewSectionPrompt(
+        section,
+        props.document.title,
+        props.document.author || "",
+        props.aiSettings.prompts.review,
+      ),
+    }));
     setPending(true);
-    setInsightPending("review");
+    setInsightPending(targetSection || "all");
     setInsightError("");
     try {
-      const reviewPrompt = `${personalizedPrompt(AI_FEATURE_PROMPTS.review, props.aiSettings.prompts.review)}\n\n论文标题：${props.document.title}\n作者信息：${props.document.author || "PDF 未提供"}\n\n只返回一个 JSON 对象，不要附加 Markdown。格式必须是：{"executiveSummary":"用一到两段说明论文做了什么、为何重要以及得出了什么结论","paperType":"实证研究|理论研究|综述|系统论文|立场论文|其他","researchQuestion":"论文试图解决的核心问题、背景与适用范围","contributions":["具体贡献及其相对已有工作的增量"],"methodologySummary":"用清晰步骤解释方法、关键机制、输入输出和重要假设","experimentalEvidence":"实验或论证设置、数据、基线、指标、主要结果、消融以及证据是否支持结论；无常规实验时说明对应的证明或材料覆盖","strengths":[{"title":"优点标题","evidence":"论文内依据","significance":"为什么重要"}],"weaknesses":[{"title":"局限标题","evidence":"论文内依据或缺失信息","significance":"对理解、适用范围或结论可信度的影响","suggestion":"阅读或使用该结论时应如何处理"}],"reproducibility":"代码、数据、参数、实现细节、计算资源和复现实验所需信息是否充分","literaturePositioning":"仅依据论文相关工作部分说明它与已有工作的关系；无法外部核实时明确说明","takeaways":["读者应该带走的核心结论、适用条件或实践启示"]}。贡献给出 2-5 项，优点和局限各给出 2-4 项，阅读结论给出 3-6 项；不得为凑数而编造。`;
-      const response = await askAssistantJson<unknown>(
-        props.aiSettings,
-        reviewPrompt,
-        { session: currentPaperSessionContext },
-        "review",
-        { cacheAffinityKey: paperCacheAffinityKey },
-      );
-      const review = normalizePaperReview(response);
+      const results = await Promise.allSettled(prompts.map(async ({ section, prompt }) => ({
+        section,
+        content: (await askAssistant(
+          props.aiSettings,
+          [{ id: crypto.randomUUID(), role: "user", content: prompt }],
+          { session: currentPaperSessionContext },
+          "review",
+          { cacheAffinityKey: paperCacheAffinityKey, maxOutputTokens: 3072 },
+        )).trim(),
+      })));
+      const previous = props.workspace.insights.review;
+      const review = previous ? {
+        overviewMarkdown: paperReviewSectionText(previous, "overview"),
+        methodMarkdown: paperReviewSectionText(previous, "method"),
+        analysisMarkdown: paperReviewSectionText(previous, "analysis"),
+      } : emptyMarkdownPaperReview();
+      const failures: string[] = [];
+      results.forEach((result, index) => {
+        const section = prompts[index].section;
+        if (result.status === "fulfilled" && result.value.content) {
+          const key = `${section}Markdown` as keyof typeof review;
+          review[key] = result.value.content;
+          return;
+        }
+        const reason = result.status === "rejected" && result.reason instanceof Error
+          ? result.reason.message
+          : "模型没有返回文本内容。";
+        failures.push(`${REVIEW_SECTION_LABELS[section]}：${reason}`);
+      });
+      if (failures.length === sections.length) throw new Error(failures.join("\n"));
+      const sessionPrompt = prompts.map(({ section, prompt }) => `[${REVIEW_SECTION_LABELS[section]}]\n${prompt}`).join("\n\n");
+      const sessionResponse = createPaperReviewMarkdown(review);
       props.onWorkspaceChange((current) => ({
         ...current,
         insights: {
           ...current.insights,
           review,
           sessionContext: currentPaperSessionContext,
-          sessionPrompt: reviewPrompt,
-          sessionResponse: JSON.stringify(response),
+          sessionPrompt,
+          sessionResponse,
           cacheAffinityKey: paperCacheAffinityKey,
           updatedAt: new Date().toISOString(),
         },
       }));
+      if (failures.length) setInsightError(`部分内容生成失败，可单独重试：\n${failures.join("\n")}`);
     } catch (error) {
       setInsightError(error instanceof Error ? error.message : "论文内容生成失败。");
     } finally {
@@ -1468,23 +1518,24 @@ export function RightPanel(props: RightPanelProps) {
         <div className="assistant-panel">
           <div className="assistant-sections-scroll">
             {(["overview", "method", "analysis"] as const).map((section) => {
-              const labels: Record<typeof section, string> = { overview: "概览", method: "方法与实验", analysis: "评析" };
               const review = props.workspace.insights.review;
+              const sectionText = review ? paperReviewSectionText(review, section) : "";
+              const sectionPending = insightPending === "all" || insightPending === section;
               return <section className={`assistant-section ${assistantSections[section] ? "is-open" : ""}`} key={section}>
                 <header className="assistant-section-header">
                   <button className="assistant-section-toggle" type="button" aria-expanded={assistantSections[section]} onClick={() => setAssistantSections((current) => ({ ...current, [section]: !current[section] }))}>
-                    <ChevronDown size={14} /><strong>{labels[section]}</strong>
+                    <ChevronDown size={14} /><strong>{REVIEW_SECTION_LABELS[section]}</strong>
                   </button>
                   <div>
-                    <IconButton label={`复制${labels[section]}`} disabled={!review} onClick={() => review && void navigator.clipboard.writeText(paperReviewSectionText(review, section))}><Copy size={13} /></IconButton>
-                    <IconButton label={review ? "重新生成完整解读" : "生成完整解读"} disabled={!fullPaperContext || pending} onClick={() => void generateInsight()}>
-                      {insightPending === "review" ? <LoaderCircle className="is-spinning" size={13} /> : <RotateCcw size={13} />}
+                    <IconButton label={`复制${REVIEW_SECTION_LABELS[section]}`} disabled={!sectionText} onClick={() => sectionText && void navigator.clipboard.writeText(sectionText)}><Copy size={13} /></IconButton>
+                    <IconButton label={review ? `重新生成${REVIEW_SECTION_LABELS[section]}` : "生成完整解读"} disabled={!fullPaperContext || pending} onClick={() => void generateInsight(review ? section : undefined)}>
+                      {sectionPending ? <LoaderCircle className="is-spinning" size={13} /> : <RotateCcw size={13} />}
                     </IconButton>
                   </div>
                 </header>
-                {assistantSections[section] && <div className="assistant-section-content" role="region" aria-label={labels[section]}>
-                  {insightPending === "review" && <div className="assistant-review-loading"><div className="thinking"><i /><i /><i /></div><span>正在解读整篇论文</span></div>}
-                  {insightPending !== "review" && review && <>
+                {assistantSections[section] && <div className="assistant-section-content" role="region" aria-label={REVIEW_SECTION_LABELS[section]}>
+                  {sectionPending && <div className="assistant-review-loading"><div className="thinking"><i /><i /><i /></div><span>正在生成{REVIEW_SECTION_LABELS[section]}</span></div>}
+                  {!sectionPending && review && <>
                     <div className={`assistant-content-clip ${expandedAssistantContent[section] ? "is-expanded" : ""}`}>
                       <PaperReviewView review={review} view={section} />
                       {!expandedAssistantContent[section] && <div className="assistant-content-fade">
@@ -1499,8 +1550,8 @@ export function RightPanel(props: RightPanelProps) {
                       </button>
                     </div>}
                   </>}
-                  {insightPending !== "review" && !review && section === "overview" && <div className="assistant-review-empty"><span>尚未生成深度解读。</span></div>}
-                  {insightPending !== "review" && !review && section !== "overview" && <p className="assistant-section-placeholder">尚无内容。</p>}
+                  {!sectionPending && !review && section === "overview" && <div className="assistant-review-empty"><span>尚未生成深度解读。</span></div>}
+                  {!sectionPending && !review && section !== "overview" && <p className="assistant-section-placeholder">尚无内容。</p>}
                 </div>}
               </section>;
             })}
