@@ -87,6 +87,7 @@ import {
   createPaperReviewMarkdown,
 } from "../lib/export";
 import { saveBytes } from "../lib/files";
+import { protectTranslationTokens } from "../lib/translation-utils";
 import { IconButton } from "./IconButton";
 import { useResizablePanel } from "./useResizablePanel";
 import { loadWorkspace } from "../lib/workspace";
@@ -1142,26 +1143,31 @@ export function RightPanel(props: RightPanelProps) {
       if (requestContent?.trim()) {
         requestMessages[requestMessages.length - 1] = { ...userMessage, content: requestContent.trim() };
       }
+      const rawContext = overrideContext ?? context;
+      const protectedContext = feature === "translation" && typeof rawContext === "string"
+        ? protectTranslationTokens(rawContext)
+        : null;
       const answer = await askAssistant(
         props.aiSettings,
         requestMessages,
-        overrideContext ?? context,
+        protectedContext ? protectedContext.text : rawContext,
         feature,
         feature === "chat" ? {
           cacheAffinityKey: paperCacheAffinityKey,
           cachePrefixMessages: prefixMessages.length || undefined,
         } : undefined,
       );
+      const restoredAnswer = protectedContext ? protectedContext.restore(answer) : answer;
       if (explainOnly) {
-        setExplanation(answer);
-        const record = { pageNumber: props.selectedTextPage || props.currentPage, sourceType: props.actionRequest?.sourceType || "text" as const, source: props.selectedText || context.slice(0, 1200), response: answer };
+        setExplanation(restoredAnswer);
+        const record = { pageNumber: props.selectedTextPage || props.currentPage, sourceType: props.actionRequest?.sourceType || "text" as const, source: props.selectedText || context.slice(0, 1200), response: restoredAnswer };
         if (feature === "translation") {
-          addSelectionTranslation({ pageNumber: record.pageNumber, sourceType: "text", source: props.selectedText || record.source, response: answer });
-          if (userMessageId) props.onSelectionTranslationResult(userMessageId, answer, false);
+          addSelectionTranslation({ pageNumber: record.pageNumber, sourceType: "text", source: props.selectedText || record.source, response: restoredAnswer });
+          if (userMessageId) props.onSelectionTranslationResult(userMessageId, restoredAnswer, false);
         }
         else addExplanationRecord(record);
       } else {
-        const assistantMessage: ChatMessage = { id: crypto.randomUUID(), role: "assistant", content: answer, createdAt: new Date().toISOString() };
+        const assistantMessage: ChatMessage = { id: crypto.randomUUID(), role: "assistant", content: restoredAnswer, createdAt: new Date().toISOString() };
         const updated = [...nextMessages, assistantMessage];
         setMessages(updated);
         persistDiscussionState(updated);

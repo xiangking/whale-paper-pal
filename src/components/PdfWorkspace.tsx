@@ -15,6 +15,7 @@ import type {
   SelectionAction,
   TextSelection,
   PageTranslation,
+  PdfVisualRegion,
   TranslationSegment,
 } from "../types";
 import { readBrandedStorage } from "../lib/brand-storage";
@@ -69,6 +70,7 @@ type PdfWorkspaceProps = {
   activeTranslationSegmentId: string | null;
   onTranslationSegmentActivate: (segment: TranslationSegment, clicked: boolean) => void;
   onTranslationRectsChange: (segmentId: string, rects: AnnotationRect[]) => void;
+  onVisualRegionsChange: (pageNumber: number, regions: PdfVisualRegion[], ready: boolean) => void;
 };
 
 type ReaderPageProps = {
@@ -105,6 +107,7 @@ type ReaderPageProps = {
   activeTranslationSegmentId: string | null;
   onTranslationSegmentActivate: (segment: TranslationSegment, clicked: boolean) => void;
   onTranslationRectsChange: (segmentId: string, rects: AnnotationRect[]) => void;
+  onVisualRegionsChange: (pageNumber: number, regions: PdfVisualRegion[], ready: boolean) => void;
 };
 
 type DragRect = { start: InkPoint; current: InkPoint };
@@ -669,6 +672,9 @@ function ReaderPage(props: ReaderPageProps) {
   const pageRef = useRef<HTMLDivElement>(null);
   const modelRegionsApplied = useRef(false);
   const modelDetectionKey = useRef("");
+  const operatorRegionsReady = useRef(false);
+  const modelRegionsReady = useRef(false);
+  const visualRegionsReadyTimer = useRef<number | null>(null);
   const erasedDuringGesture = useRef(new Set<string>());
   const citationElementNumbers = useRef<Record<string, number>>({});
   const [shouldRender, setShouldRender] = useState(props.pageNumber <= 3);
@@ -679,11 +685,30 @@ function ReaderPage(props: ReaderPageProps) {
   const [resolvedCommentRects, setResolvedCommentRects] = useState<Record<string, AnnotationRect[]>>({});
   const [resolvedTranslationRects, setResolvedTranslationRects] = useState<Record<string, AnnotationRect[]>>({});
   const [visualRegions, setVisualRegions] = useState<VisualRegion[]>([]);
+  const [visualRegionsReady, setVisualRegionsReady] = useState(false);
   const [activeVisual, setActiveVisual] = useState<{ id: string; layered: boolean } | null>(null);
   const [copiedVisualId, setCopiedVisualId] = useState<string | null>(null);
   const [visualContextMenu, setVisualContextMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const [annotationContextMenu, setAnnotationContextMenu] = useState<{ id: string; x: number; y: number } | null>(null);
   const [urlContextMenu, setUrlContextMenu] = useState<{ url: string; x: number; y: number } | null>(null);
+
+  const rectRecordsEqual = (left: Record<string, AnnotationRect[]>, right: Record<string, AnnotationRect[]>) => {
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+    if (leftKeys.length !== rightKeys.length) return false;
+    return leftKeys.every((key) => {
+      const a = left[key] || [];
+      const b = right[key] || [];
+      return a.length === b.length && a.every((rect, index) => {
+        const other = b[index];
+        return other
+          && rect.left === other.left
+          && rect.top === other.top
+          && rect.width === other.width
+          && rect.height === other.height;
+      });
+    });
+  };
 
   const renderHighlightedText = useCallback(
     ({ str }: { str: string }) => escapeAndHighlight(str, props.query),
@@ -697,13 +722,38 @@ function ReaderPage(props: ReaderPageProps) {
   useEffect(() => {
     if (!shouldRender) return;
     modelRegionsApplied.current = false;
+    operatorRegionsReady.current = false;
+    modelRegionsReady.current = false;
+    if (visualRegionsReadyTimer.current !== null) window.clearTimeout(visualRegionsReadyTimer.current);
+    setVisualRegionsReady(false);
     let cancelled = false;
     void props.pdf.getPage(props.pageNumber)
       .then((page) => extractVisualRegions(page, props.rotation))
       .then((regions) => { if (!cancelled && !modelRegionsApplied.current) setVisualRegions(regions); })
-      .catch(() => { if (!cancelled && !modelRegionsApplied.current) setVisualRegions([]); });
-    return () => { cancelled = true; };
+      .catch(() => { if (!cancelled && !modelRegionsApplied.current) setVisualRegions([]); })
+      .finally(() => {
+        if (cancelled) return;
+        operatorRegionsReady.current = true;
+        if (modelRegionsReady.current) {
+          visualRegionsReadyTimer.current = window.setTimeout(() => setVisualRegionsReady(true), 400);
+        }
+      });
+    return () => {
+      cancelled = true;
+      if (visualRegionsReadyTimer.current !== null) window.clearTimeout(visualRegionsReadyTimer.current);
+    };
   }, [props.pageNumber, props.pdf, props.rotation, shouldRender]);
+
+  useEffect(() => {
+    props.onVisualRegionsChange(
+      props.pageNumber,
+      visualRegions.map((region) => {
+        const canonical = transformRect(region, (point) => displayPointToCanonical(point, props.rotation));
+        return { ...canonical, kind: region.kind };
+      }),
+      visualRegionsReady,
+    );
+  }, [props.onVisualRegionsChange, props.pageNumber, props.rotation, visualRegions, visualRegionsReady]);
 
   useEffect(() => {
     setActiveVisual(null);
@@ -772,9 +822,31 @@ function ReaderPage(props: ReaderPageProps) {
         const classified = classifyVisualRegions(pageElement, current);
         const tables = detectTextTableRegions(pageElement);
         const additions = tables.filter((table) => !classified.some((region) => (
-          region.kind === "table" && (regionContains(region, table) || regionContains(table, region))
+          region.id === table.id
+          || (region.kind === "table" && (regionContains(region, table) || regionContains(table, region)))
         )));
-        return [...classified, ...additions];
+        // Text-table detection runs again whenever the PDF text layer mutates.
+        // Remove repeated IDs and overlapping table candidates instead of
+        // retaining two interactive overlays for the same table.
+        const nextRegions = [...classified, ...additions].filter((region, index, all) => (
+          all.findIndex((candidate) => candidate.id === region.id) === index
+          && !all.slice(0, index).some((candidate) => (
+            candidate.kind === "table" && region.kind === "table"
+            && (regionContains(candidate, region) || regionContains(region, candidate))
+          ))
+        ));
+        // The resolver runs from a text-layer observer. Avoid rerendering when
+        // classification is unchanged, otherwise overlay updates can keep the
+        // observer busy indefinitely.
+        if (current.length === nextRegions.length && current.every((region, index) => (
+          region.id === nextRegions[index]?.id
+          && region.kind === nextRegions[index]?.kind
+          && region.left === nextRegions[index]?.left
+          && region.top === nextRegions[index]?.top
+          && region.width === nextRegions[index]?.width
+          && region.height === nextRegions[index]?.height
+        ))) return current;
+        return nextRegions;
       });
       const next: Record<string, AnnotationRect[]> = {};
       props.autoHighlights.forEach((item) => {
@@ -791,14 +863,14 @@ function ReaderPage(props: ReaderPageProps) {
           );
         }
       });
-      setResolvedAutoRects(next);
+      setResolvedAutoRects((current) => rectRecordsEqual(current, next) ? current : next);
       const nextComments: Record<string, AnnotationRect[]> = {};
       props.comments.forEach((comment) => {
         nextComments[comment.id] = comment.rects?.length
           ? comment.rects.map((rect) => transformRect(rect, (point) => canonicalPointToDisplay(point, props.rotation)))
           : resolveQuoteRects(pageElement, comment.quote);
       });
-      setResolvedCommentRects(nextComments);
+      setResolvedCommentRects((current) => rectRecordsEqual(current, nextComments) ? current : nextComments);
       const nextTranslations: Record<string, AnnotationRect[]> = {};
       props.translationSegments.forEach((segment) => {
         const displayRects = segment.rects?.length
@@ -812,7 +884,7 @@ function ReaderPage(props: ReaderPageProps) {
           );
         }
       });
-      setResolvedTranslationRects(nextTranslations);
+      setResolvedTranslationRects((current) => rectRecordsEqual(current, nextTranslations) ? current : nextTranslations);
     };
     const scheduleResolve = () => {
       window.cancelAnimationFrame(frame);
@@ -830,8 +902,12 @@ function ReaderPage(props: ReaderPageProps) {
       }
     };
     const layerObserver = new MutationObserver(connectTextLayer);
-    layerObserver.observe(pageElement, { childList: true, subtree: true });
+    // Only watch direct children while react-pdf mounts the text layer. The
+    // previous subtree observer also saw our annotation/translation overlays,
+    // causing a render -> mutation -> render loop.
+    layerObserver.observe(pageElement, { childList: true });
     connectTextLayer();
+    if (observedTextLayer) layerObserver.disconnect();
     retry = window.setTimeout(scheduleResolve, 350);
     return () => {
       layerObserver.disconnect();
@@ -886,11 +962,17 @@ function ReaderPage(props: ReaderPageProps) {
     if (modelDetectionKey.current === detectionKey) return;
     modelDetectionKey.current = detectionKey;
     void detectLayoutModel(canvas, props.documentId, props.pageNumber, props.rotation).then((regions) => {
-      if (!regions.length || !pageRef.current) return;
-      modelRegionsApplied.current = true;
-      setVisualRegions(classifyVisualRegions(pageRef.current, regions));
+      if (regions.length && pageRef.current) {
+        modelRegionsApplied.current = true;
+        setVisualRegions(classifyVisualRegions(pageRef.current, regions));
+      }
     }).catch(() => {
       // Local PDF drawing and text heuristics remain available if ONNX inference fails.
+    }).finally(() => {
+      modelRegionsReady.current = true;
+      if (operatorRegionsReady.current) {
+        visualRegionsReadyTimer.current = window.setTimeout(() => setVisualRegionsReady(true), 400);
+      }
     });
   };
 
@@ -1042,6 +1124,23 @@ function ReaderPage(props: ReaderPageProps) {
     if (!pageRef.current) return;
     if (props.mode === "select") {
       const point = pointFromEvent(event, pageRef.current);
+      const textTarget = event.target instanceof Element
+        ? event.target.closest(".textLayer span, .textLayer br")
+        : null;
+      // Layout-model regions are visual metadata. They must never sit on top
+      // of selectable PDF text. Activate a region only when the pointer is in
+      // its non-text part; dragging from a text span stays a native selection.
+      if (!textTarget) {
+        const hitRegion = visualRegions.find((region) => (
+          point.x >= region.left && point.x <= region.left + region.width
+          && point.y >= region.top && point.y <= region.top + region.height
+        ));
+        if (hitRegion) {
+          setActiveVisual({ id: hitRegion.id, layered: false });
+          setVisualContextMenu(null);
+          return;
+        }
+      }
       const activeRegion = visualRegions.find((region) => region.id === activeVisual?.id);
       const insideActive = activeRegion
         && point.x >= activeRegion.left && point.x <= activeRegion.left + activeRegion.width
@@ -1194,6 +1293,22 @@ function ReaderPage(props: ReaderPageProps) {
           y: (event.clientY - bounds.top) / bounds.height,
         };
         const canonicalPoint = displayPointToCanonical(displayPoint, props.rotation);
+        const visualRegion = visualRegions.find((region) => (
+          displayPoint.x >= region.left && displayPoint.x <= region.left + region.width
+          && displayPoint.y >= region.top && displayPoint.y <= region.top + region.height
+        ));
+        const textTarget = event.target instanceof Element
+          ? event.target.closest(".textLayer span, .textLayer br")
+          : null;
+        if (visualRegion && !textTarget) {
+          event.preventDefault();
+          event.stopPropagation();
+          window.getSelection()?.removeAllRanges();
+          props.onSelection(null);
+          setActiveVisual({ id: visualRegion.id, layered: false });
+          setVisualContextMenu({ id: visualRegion.id, x: event.clientX, y: event.clientY });
+          return;
+        }
         const annotation = [...props.annotations].reverse().find((item) => item.type === "highlight" && item.rects.some((rect) => (
           canonicalPoint.x >= rect.left && canonicalPoint.x <= rect.left + rect.width
           && canonicalPoint.y >= rect.top && canonicalPoint.y <= rect.top + rect.height
@@ -1245,14 +1360,6 @@ function ReaderPage(props: ReaderPageProps) {
         )))}
         {props.comments.filter((comment) => !comment.resolved).flatMap((comment) => (resolvedCommentRects[comment.id] || []).map((rect, index) => (
           <span className="comment-anchor-mark" key={`${comment.id}-${index}`} style={{ left: `${rect.left * 100}%`, top: `${rect.top * 100}%`, width: `${rect.width * 100}%`, height: `${rect.height * 100}%` }} />
-        )))}
-        {props.translationSegments.flatMap((segment) => (resolvedTranslationRects[segment.id] || []).map((rect, index) => (
-          <span
-            className={`translation-link-mark ${props.activeTranslationSegmentId === segment.id ? "is-active" : ""}`}
-            data-segment-id={segment.id}
-            key={`${segment.id}-${index}`}
-            style={{ left: `${rect.left * 100}%`, top: `${rect.top * 100}%`, width: `${rect.width * 100}%`, height: `${rect.height * 100}%` }}
-          />
         )))}
       </div>
       <svg className={`ink-layer ${["draw", "erase"].includes(props.mode) ? "is-interactive" : ""}`} viewBox="0 0 1 1" preserveAspectRatio="none" aria-hidden="true">
@@ -1523,13 +1630,6 @@ export function PdfWorkspace(props: PdfWorkspaceProps) {
   }, [props.targetPage]);
 
   useEffect(() => {
-    if (!props.activeTranslationSegmentId) return;
-    const segmentId = CSS.escape(props.activeTranslationSegmentId);
-    document.querySelector<HTMLElement>(`.translation-link-mark[data-segment-id="${segmentId}"]`)
-      ?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [props.activeTranslationSegmentId]);
-
-  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "z" || !["draw", "erase"].includes(props.mode)) return;
       event.preventDefault();
@@ -1706,6 +1806,7 @@ export function PdfWorkspace(props: PdfWorkspaceProps) {
             activeTranslationSegmentId={props.activeTranslationSegmentId}
             onTranslationSegmentActivate={props.onTranslationSegmentActivate}
             onTranslationRectsChange={props.onTranslationRectsChange}
+            onVisualRegionsChange={props.onVisualRegionsChange}
           />
         ))}
       </div>

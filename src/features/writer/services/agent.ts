@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AgentAccessMode, AgentThirdPartyConfig } from "../../../types";
+import type { AgentAccessMode, AgentPaths, AgentThirdPartyConfig } from "../../../types";
 
 export type AgentRuntimeId = "claude_code" | "codex_runtime";
 
@@ -16,19 +16,22 @@ export type AgentModelInfo = { id: string; label: string; isDefault: boolean; co
 export type AgentFileChange = { path: string; content: string; reason?: string };
 export type AgentReply = { message: string; changes: AgentFileChange[] };
 
-export async function getAgentRuntimeStatus(): Promise<AgentRuntimeInfo[]> {
-  return invoke<AgentRuntimeInfo[]>("agent_runtime_status");
+export async function getAgentRuntimeStatus(options?: { paths?: AgentPaths; refresh?: boolean }): Promise<AgentRuntimeInfo[]> {
+  return invoke<AgentRuntimeInfo[]>("agent_runtime_status", {
+    request: { paths: options?.paths || {}, refresh: options?.refresh || false },
+  });
 }
 
 export async function getAgentModelList(
   runtime: AgentRuntimeId,
-  options?: { accessMode?: AgentAccessMode; thirdParty?: AgentThirdPartyConfig },
+  options?: { accessMode?: AgentAccessMode; thirdParty?: AgentThirdPartyConfig; cliPath?: string },
 ): Promise<AgentModelInfo[]> {
   return invoke<AgentModelInfo[]>("agent_model_list", {
     request: {
       runtime,
       accessMode: options?.accessMode,
       thirdParty: options?.thirdParty,
+      cliPath: options?.cliPath,
     },
   });
 }
@@ -117,6 +120,7 @@ export async function runWriterAgent(request: {
   permissionMode?: "full" | "plan";
   accessMode?: AgentAccessMode;
   thirdParty?: AgentThirdPartyConfig;
+  cliPath?: string;
   skill?: "paper_check";
   prompt: string;
 }): Promise<AgentReply> {

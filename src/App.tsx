@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Document, pdfjs } from "react-pdf";
 import type { PDFDocumentProxy } from "pdfjs-dist";
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 import "./markdown.css";
@@ -21,13 +22,14 @@ import { WritingWorkspace } from "./features/writer/WritingWorkspace";
 import { WriterLibrary } from "./features/writer/WriterLibrary";
 import { resolveWriterFile } from "./features/writer/services/local-writer";
 import { loadAnnotations, saveAnnotations } from "./lib/annotations";
-import { AI_FEATURE_PROMPTS, askAssistant, loadAiSettings, personalizedPrompt, saveAiSettings } from "./lib/ai";
+import { AI_FEATURE_PROMPTS, askAssistant, askAssistantJson, loadAiSettings, personalizedPrompt, saveAiSettings } from "./lib/ai";
 import { emptyWorkspace, loadWorkspace, saveWorkspace } from "./lib/workspace";
 import { openPdfFile, openPdfPath, pdfFileFromDrop } from "./lib/files";
 import { addCitationToLibrary, loadLibrary, rememberDocument, removeFromLibrary, updateLibraryEntry, updateReadingPosition } from "./lib/library";
 import { discoveryLibraryId, type DiscoveryPaper } from "./lib/discovery";
 import type { DesktopPetContext } from "./lib/desktop-pet";
-import { buildTextIndex, resolveOutline, searchTextIndex } from "./lib/pdf";
+import { buildPdfTextBlocks, resolveOutline, searchTextIndex } from "./lib/pdf";
+import { buildPageTranslationRequests, translatePageBatches } from "./lib/page-translation";
 import type {
   AiSettings,
   Annotation,
@@ -40,17 +42,17 @@ import type {
   OutlineEntry,
   PdfDocumentState,
   PdfFile,
+  PdfVisualRegion,
   RightPanelTab,
   ReaderMode,
   ReaderFeatureAction,
   QuizQuestion,
   SelectionAction,
   TextSelection,
-  TranslationSegment,
 } from "./types";
 import "./styles.css";
 
-pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 function documentTitleFromFilename(filename: string): string {
   return filename.replace(/\.pdf$/i, "").replace(/[_-]+/g, " ");
@@ -61,40 +63,9 @@ type TranslationTaskState = {
   message?: string;
 };
 
-type TextPart = { text: string; start: number; end: number };
-
-function splitTranslationParts(value: string): TextPart[] {
-  const parts: TextPart[] = [];
-  const pattern = /[^.!?。！？\n]+[.!?。！？]?/g;
-  for (const match of value.matchAll(pattern)) {
-    const raw = match[0];
-    const text = raw.trim();
-    if (!text || match.index === undefined) continue;
-    const offset = raw.indexOf(text);
-    parts.push({ text, start: match.index + offset, end: match.index + offset + text.length });
-  }
-  return parts.length ? parts : (value.trim() ? (() => {
-    const text = value.trim();
-    const start = value.indexOf(text);
-    return [{ text, start, end: start + text.length }];
-  })() : []);
-}
-
-function buildTranslationSegments(source: string, target: string): TranslationSegment[] {
-  const sources = splitTranslationParts(source);
-  const targets = splitTranslationParts(target);
-  if (!sources.length || !targets.length) return [];
-  return sources.map((part, index) => {
-    const targetPart = targets[Math.min(index, targets.length - 1)];
-    return {
-      id: crypto.randomUUID(),
-      sourceText: part.text,
-      sourceRange: { start: part.start, end: part.end },
-      targetText: targetPart.text,
-      targetRange: { start: targetPart.start, end: targetPart.end },
-    };
-  });
-}
+// Bump when source block/text normalization changes so cached translations
+// generated from malformed PDF text are discarded automatically.
+const TRANSLATION_LAYOUT_VERSION = 10;
 
 async function inferDocumentTitle(proxy: PDFDocumentProxy): Promise<string | undefined> {
   try {
@@ -131,7 +102,9 @@ function WhalePaperApp() {
   const [outline, setOutline] = useState<OutlineEntry[]>([]);
   const [outlineLoading, setOutlineLoading] = useState(false);
   const [textIndex, setTextIndex] = useState<string[]>([]);
+  const [textBlocks, setTextBlocks] = useState<import("./types").PdfTextBlock[][]>([]);
   const [indexProgress, setIndexProgress] = useState(0);
+  const [textExtractionError, setTextExtractionError] = useState("");
   const [query, setQuery] = useState("");
   const [currentPage, setCurrentPage] = useState(1);
   const [targetPage, setTargetPage] = useState(1);
@@ -160,23 +133,66 @@ function WhalePaperApp() {
   const [exportOpen, setExportOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [pdfLoadProgress, setPdfLoadProgress] = useState<{ loaded: number; total: number } | null>(null);
+  const [pdfLoadFailure, setPdfLoadFailure] = useState<"timeout" | "error" | null>(null);
   const [translationTasks, setTranslationTasks] = useState<Record<number, TranslationTaskState>>({});
   const [selectionTranslationPopup, setSelectionTranslationPopup] = useState<SelectionTranslationPopupState | null>(null);
   const [writerLocation, setWriterLocation] = useState<{ rootPath: string; initialFile?: string } | null>(null);
   const [homeMode, setHomeMode] = useState<HomeMode>("reader");
   const translationRequestsRef = useRef(new Map<number, string>());
   const translationSessionRef = useRef(0);
+  const translationVisualRegionsRef = useRef(new Map<number, PdfVisualRegion[]>());
+  const translationVisualRegionsReadyRef = useRef(new Set<number>());
+  const translationVisualRegionWaitersRef = useRef(new Map<number, Set<() => void>>());
+  const pdfLoadTimerRef = useRef<number | null>(null);
+  const pdfLoadAttemptRef = useRef(0);
   const desktopPetEnabledRef = useRef(aiSettings.desktopPet.enabled);
   const desktopPetContextRef = useRef<DesktopPetContext>({ documentId: "", title: "", page: 1, pageText: "", selectedText: "" });
 
   const updateTranslationRects = useCallback((segmentId: string, rects: AnnotationRect[]) => {
-    setWorkspace((current) => ({
-      ...current,
-      translations: current.translations.map((translation) => ({
+    setWorkspace((current) => {
+      let changed = false;
+      const translations = current.translations.map((translation) => ({
         ...translation,
-        segments: translation.segments?.map((segment) => segment.id === segmentId ? { ...segment, rects } : segment),
-      })),
-    }));
+        segments: translation.segments?.map((segment) => {
+          if (segment.id !== segmentId) return segment;
+          const previous = segment.rects || [];
+          const same = previous.length === rects.length && previous.every((item, index) => {
+            const next = rects[index];
+            return next && item.left === next.left && item.top === next.top && item.width === next.width && item.height === next.height;
+          });
+          if (same) return segment;
+          changed = true;
+          return { ...segment, rects };
+        }),
+      }));
+      return changed ? { ...current, translations } : current;
+    });
+  }, []);
+
+  const updateTranslationVisualRegions = useCallback((pageNumber: number, regions: PdfVisualRegion[], ready: boolean) => {
+    translationVisualRegionsRef.current.set(pageNumber, regions);
+    if (!ready) return;
+    translationVisualRegionsReadyRef.current.add(pageNumber);
+    translationVisualRegionWaitersRef.current.get(pageNumber)?.forEach((resolve) => resolve());
+    translationVisualRegionWaitersRef.current.delete(pageNumber);
+  }, []);
+
+  const waitForTranslationVisualRegions = useCallback((pageNumber: number) => {
+    if (translationVisualRegionsReadyRef.current.has(pageNumber)) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const waiters = translationVisualRegionWaitersRef.current.get(pageNumber) || new Set<() => void>();
+      let timer = 0;
+      const finish = () => {
+        window.clearTimeout(timer);
+        waiters.delete(finish);
+        if (!waiters.size) translationVisualRegionWaitersRef.current.delete(pageNumber);
+        resolve();
+      };
+      waiters.add(finish);
+      translationVisualRegionWaitersRef.current.set(pageNumber, waiters);
+      timer = window.setTimeout(finish, 8000);
+    });
   }, []);
 
   // PDF.js transfers this buffer to its worker. Keep the original bytes intact for export and reload.
@@ -191,12 +207,23 @@ function WhalePaperApp() {
   )), [workspace.autoHighlights, workspace.preferences.highlightVisibility]);
 
   const loadFile = useCallback((nextFile: PdfFile) => {
+    pdfLoadAttemptRef.current += 1;
+    if (pdfLoadTimerRef.current !== null) {
+      window.clearTimeout(pdfLoadTimerRef.current);
+      pdfLoadTimerRef.current = null;
+    }
     translationSessionRef.current += 1;
     translationRequestsRef.current.clear();
+    translationVisualRegionsRef.current.clear();
+    translationVisualRegionsReadyRef.current.clear();
+    translationVisualRegionWaitersRef.current.forEach((waiters) => waiters.forEach((resolve) => resolve()));
+    translationVisualRegionWaitersRef.current.clear();
     setFile(nextFile);
     setDocument(null);
     setOutline([]);
     setTextIndex([]);
+    setTextBlocks([]);
+    setTextExtractionError("");
     setIndexProgress(0);
     setQuery("");
     setCurrentPage(1);
@@ -214,8 +241,36 @@ function WhalePaperApp() {
     setWorkspace(emptyWorkspace());
     setActiveTranslationSegmentId(null);
     setTranslationTasks({});
+    setPdfLoadProgress(null);
+    setPdfLoadFailure(null);
     setError("");
   }, []);
+
+  useEffect(() => {
+    if (!file) return;
+    const attempt = pdfLoadAttemptRef.current;
+    setPdfLoadProgress(null);
+    setPdfLoadFailure(null);
+    if (!file.data?.byteLength) {
+      setError("这个 PDF 文件为空，无法解析。");
+      setPdfLoadFailure("error");
+      return;
+    }
+    pdfLoadTimerRef.current = window.setTimeout(() => {
+      // PDF.js can leave getDocument pending forever for a truncated file or
+      // a worker that was invalidated during HMR. Unmount it so the reader can
+      // show a useful recovery action instead of spinning indefinitely.
+      if (pdfLoadAttemptRef.current !== attempt) return;
+      setPdfLoadFailure("timeout");
+      setError("PDF 解析超过 30 秒，文件可能不完整或 PDF.js 工作线程未响应。请重试；如果仍失败，请重新下载这篇论文。");
+    }, 30_000);
+    return () => {
+      if (pdfLoadTimerRef.current !== null) {
+        window.clearTimeout(pdfLoadTimerRef.current);
+        pdfLoadTimerRef.current = null;
+      }
+    };
+  }, [file]);
 
   const chooseFile = useCallback(async () => {
     setLoading(true);
@@ -292,10 +347,25 @@ function WhalePaperApp() {
   }, [loadFile]);
 
   const handleDocumentLoad = useCallback(async (proxy: PDFDocumentProxy) => {
+    if (pdfLoadTimerRef.current !== null) {
+      window.clearTimeout(pdfLoadTimerRef.current);
+      pdfLoadTimerRef.current = null;
+    }
+    setPdfLoadProgress({ loaded: file?.data.byteLength || 1, total: file?.data.byteLength || 1 });
+    setPdfLoadFailure(null);
     if (!file) return;
     let title = file.displayTitle?.trim() || documentTitleFromFilename(file.name);
     let hasMetadataTitle = Boolean(file.displayTitle?.trim());
     let author = file.displayAuthor?.trim() || "";
+    const id = proxy.fingerprints[0] || `${file.name}:${proxy.numPages}`;
+    const previous = loadLibrary().find((entry) => entry.id === id);
+    const resumePage = Math.min(proxy.numPages, Math.max(1, previous?.lastPage || 1));
+    // Mount the reader as soon as PDF.js has produced a document. Metadata and
+    // title extraction can be slow on large PDFs and must not block rendering.
+    const provisionalDocument = { id, file, proxy, title, author, pageCount: proxy.numPages };
+    setDocument(provisionalDocument);
+    setCurrentPage(resumePage);
+    setTargetPage(resumePage);
     const nextMetadata: Pick<PdfDocumentState, "subject" | "keywords" | "year"> = {};
     try {
       const metadata = await proxy.getMetadata();
@@ -316,15 +386,15 @@ function WhalePaperApp() {
       // Metadata is optional and malformed values should not block reading.
     }
     if (!hasMetadataTitle) title = await inferDocumentTitle(proxy) || title;
-    const id = proxy.fingerprints[0] || `${file.name}:${proxy.numPages}`;
     const nextDocument = { id, file, proxy, title, author, pageCount: proxy.numPages, ...nextMetadata };
-    const previous = loadLibrary().find((entry) => entry.id === id);
-    const resumePage = Math.min(proxy.numPages, Math.max(1, previous?.lastPage || 1));
     setDocument(nextDocument);
     setCurrentPage(resumePage);
     setTargetPage(resumePage);
     setAnnotations(loadAnnotations(id));
     const nextWorkspace = loadWorkspace(id, { theme: aiSettings.appearance.documentTheme });
+    // Translation coordinates are tied to the current block layout. Drop older
+    // cached pages immediately so stale absolute-positioned content never flashes.
+    nextWorkspace.translations = nextWorkspace.translations.filter((translation) => translation.layoutVersion === TRANSLATION_LAYOUT_VERSION);
     setWorkspace(nextWorkspace);
     setZoom(nextWorkspace.preferences.zoom);
     setRotation(nextWorkspace.preferences.rotation);
@@ -338,8 +408,42 @@ function WhalePaperApp() {
     void resolveOutline(document.proxy)
       .then((items) => !cancelled && setOutline(items))
       .finally(() => !cancelled && setOutlineLoading(false));
-    void buildTextIndex(document.proxy, (progress) => !cancelled && setIndexProgress(progress)).then((index) => {
-      if (!cancelled) setTextIndex(index);
+    void buildPdfTextBlocks(
+      document.proxy,
+      (progress) => !cancelled && setIndexProgress(progress),
+      (_pageNumber, error) => {
+        if (!cancelled) setTextExtractionError((current) => current || (error instanceof Error ? error.message : "部分页面的 PDF 版面文字提取失败。"));
+      },
+    ).then((blocks) => {
+      if (cancelled) return;
+      setTextBlocks(blocks);
+      // Keep search/context text in the same reading order as translation
+      // blocks. PDF content streams commonly emit the right column after a
+      // footnote or in visual order, so concatenating raw items here causes
+      // cross-column words and broken fallback requests.
+      const orderedPageText = blocks.map((pageBlocks) => pageBlocks
+        .slice()
+        .sort((left, right) => left.order - right.order)
+        .map((block) => block.text)
+        .filter(Boolean)
+        .join("\n\n"));
+      if (orderedPageText.some(Boolean)) setTextIndex(orderedPageText);
+      // Invalidate translations produced with an older coordinate model.
+      // Keeping them would render stale rectangles over the new PDF layout.
+      setWorkspace((current) => {
+        const translations = current.translations.filter((translation) => {
+          const pageBlocks = blocks[translation.pageNumber - 1] || [];
+          const validIds = new Set(pageBlocks.map((block) => block.id));
+          if (translation.layoutVersion !== TRANSLATION_LAYOUT_VERSION) return false;
+          return !translation.segments?.length || translation.segments.every((segment) => {
+            const ids = segment.sourceBlockIds?.length ? segment.sourceBlockIds : segment.sourceBlockId ? [segment.sourceBlockId] : [];
+            return ids.every((id) => validIds.has(id));
+          });
+        });
+        return translations.length === current.translations.length ? current : { ...current, translations };
+      });
+    }).catch((error) => {
+      if (!cancelled) setTextExtractionError((current) => current || (error instanceof Error ? error.message : "PDF 版面文字提取失败。"));
     });
     return () => { cancelled = true; };
   }, [document]);
@@ -351,6 +455,18 @@ function WhalePaperApp() {
   useEffect(() => {
     if (document) saveWorkspace(document.id, workspace);
   }, [document, workspace]);
+
+  // A persisted translation view is a focused reading layout. Older sessions
+  // may have left the discovery, thumbnail, or assistant panels open, which
+  // compresses the PDF and translation columns into a narrow vertical strip.
+  // Normalize those auxiliary panels whenever the translation view is active,
+  // including when that view is restored during document loading.
+  useEffect(() => {
+    if (!workspace.preferences.translationViewOpen) return;
+    setLeftOpen(false);
+    setRightOpen(false);
+    setDiscoveryOpen(false);
+  }, [workspace.preferences.translationViewOpen]);
 
   useEffect(() => {
     window.document.documentElement.dataset.reduceMotion = aiSettings.appearance.reduceMotion ? "true" : "false";
@@ -454,9 +570,17 @@ function WhalePaperApp() {
     if (!document || translationRequestsRef.current.has(pageNumber)) return;
     const sourceText = (textIndex[pageNumber - 1] || "").trim();
     if (!sourceText) {
+      const extractionDone = indexProgress >= document.pageCount;
       setTranslationTasks((current) => ({
         ...current,
-        [pageNumber]: { status: "error", message: "当前页还没有可翻译文本，请等待 PDF 文本解析完成后重试。" },
+        [pageNumber]: {
+          status: "error",
+          message: extractionDone
+            ? (textExtractionError
+              ? `PDF 文字提取未完成：${textExtractionError}`
+              : "当前页没有可提取的文字。这个 PDF 可能是扫描图片，或文字已经转成路径；需要 OCR 后才能翻译。")
+            : "正在提取 PDF 文字，请等待索引完成后重试。",
+        },
       }));
       return;
     }
@@ -466,18 +590,37 @@ function WhalePaperApp() {
     translationRequestsRef.current.set(pageNumber, requestId);
     setTranslationTasks((current) => ({ ...current, [pageNumber]: { status: "loading" } }));
     try {
-      const answer = await askAssistant(
-        aiSettings,
-        [{ id: crypto.randomUUID(), role: "user", content: personalizedPrompt(AI_FEATURE_PROMPTS.translation, aiSettings.prompts.translation) }],
-        sourceText.slice(0, 16000),
-        "translation",
-      );
+      await waitForTranslationVisualRegions(pageNumber);
+      if (session !== translationSessionRef.current || translationRequestsRef.current.get(pageNumber) !== requestId) return;
+      const prompt = `${personalizedPrompt(AI_FEATURE_PROMPTS.translation, aiSettings.prompts.translation)}\n\n本轮输入是一个已按 PDF 版面还原的自然段或独立结构块。完整翻译这个单元，不要继续按句子拆分，也不要把相邻段落补入本轮译文。保留标题、公式、引用编号、表格结构、术语、URL、DOI 和邮箱占位符；不要输出解释、额外标题或代码块。`;
+      const pageBlocks = textBlocks[pageNumber - 1] || [];
+      const requests = buildPageTranslationRequests(pageBlocks, sourceText, 8000, translationVisualRegionsRef.current.get(pageNumber) || []);
+      if (!requests.length) throw new Error("当前页只有图表内部文字，没有需要翻译的正文或图注。");
+      const translatedPage = await translatePageBatches(requests, async (batch, protectedItems) => {
+        if (session !== translationSessionRef.current || translationRequestsRef.current.get(pageNumber) !== requestId) {
+          throw new Error("翻译已取消。");
+        }
+        const itemText = protectedItems.map((item) => `ID: ${item.id}\n原文:\n${item.sourceText}`).join("\n\n---\n\n");
+        const result = await askAssistantJson<{ items?: Array<{ id?: string; translation?: string }> }>(
+          aiSettings,
+          `${prompt}\n\n这是一个批次，共 ${protectedItems.length} 个独立段落。请保持每个 ID 不变，返回 JSON：{ "items": [{ "id": "原ID", "translation": "完整译文" }] }。不要遗漏或合并段落。\n\n${itemText}`,
+          "",
+          "translation",
+          { temperature: 0.1, disableReasoning: true, omitMaxOutputTokens: true, maxOutputTokens: undefined },
+        );
+        const output: Record<string, string> = {};
+        for (const item of result.items || []) if (item.id && typeof item.translation === "string") output[item.id] = item.translation;
+        if (Object.keys(output).length !== protectedItems.length) throw new Error(`翻译批次返回不完整（${batch.id}）。`);
+        return output;
+      });
+      const answer = translatedPage.content;
+      const blockSegments = translatedPage.segments;
       if (session !== translationSessionRef.current || translationRequestsRef.current.get(pageNumber) !== requestId) return;
       setWorkspace((current) => ({
         ...current,
         translations: [
           ...current.translations.filter((item) => item.pageNumber !== pageNumber),
-          { pageNumber, sourceLanguage: "auto", targetLanguage: "zh-CN", content: answer, segments: buildTranslationSegments(sourceText, answer), updatedAt: new Date().toISOString() },
+          { pageNumber, layoutVersion: TRANSLATION_LAYOUT_VERSION, sourceLanguage: "auto", targetLanguage: "zh-CN", content: answer, segments: blockSegments, updatedAt: new Date().toISOString() },
         ],
       }));
       setTranslationTasks((current) => {
@@ -497,7 +640,7 @@ function WhalePaperApp() {
     } finally {
       if (translationRequestsRef.current.get(pageNumber) === requestId) translationRequestsRef.current.delete(pageNumber);
     }
-  }, [aiSettings, document, textIndex]);
+  }, [aiSettings, document, indexProgress, textBlocks, textExtractionError, textIndex, waitForTranslationVisualRegions]);
 
   useEffect(() => {
     if (!document || !workspace.preferences.autoTranslateEnabled) return;
@@ -506,22 +649,6 @@ function WhalePaperApp() {
     const timer = window.setTimeout(() => void translatePage(currentPage), 220);
     return () => window.clearTimeout(timer);
   }, [currentPage, document, textIndex, translatePage, workspace.preferences.autoTranslateEnabled, workspace.translations]);
-
-  useEffect(() => {
-    if (!textIndex.length) return;
-    setWorkspace((current) => {
-      let changed = false;
-      const translations = current.translations.map((translation) => {
-        if (translation.segments?.length) return translation;
-        const source = textIndex[translation.pageNumber - 1] || "";
-        const segments = buildTranslationSegments(source, translation.content);
-        if (!segments.length) return translation;
-        changed = true;
-        return { ...translation, segments };
-      });
-      return changed ? { ...current, translations } : current;
-    });
-  }, [textIndex]);
 
   const createAnnotation = (selection: TextSelection, type: "highlight" | "note", color: Annotation["color"]) => {
     if (!document) return;
@@ -724,7 +851,7 @@ function WhalePaperApp() {
 
   return (
     <main
-      className={`app-shell theme-${workspace.preferences.theme}`}
+      className={`app-shell theme-${workspace.preferences.theme}${workspace.preferences.translationViewOpen ? " is-translation-view" : ""}`}
       onDragOver={(event) => event.preventDefault()}
       onDrop={(event) => {
         event.preventDefault();
@@ -732,7 +859,7 @@ function WhalePaperApp() {
         if (droppedFile?.name.toLowerCase().endsWith(".pdf")) void pdfFileFromDrop(droppedFile).then(loadFile);
       }}
     >
-      {discoveryOpen && document && (
+      {discoveryOpen && !workspace.preferences.translationViewOpen && document && (
         <DiscoverySidebar
           document={document}
           entries={library}
@@ -755,9 +882,9 @@ function WhalePaperApp() {
           rotation={rotation}
           theme={workspace.preferences.theme}
           mode={readerMode}
-          leftOpen={leftOpen}
-          rightOpen={rightOpen}
-          discoveryOpen={discoveryOpen}
+          leftOpen={leftOpen && !workspace.preferences.translationViewOpen}
+          rightOpen={rightOpen && !workspace.preferences.translationViewOpen}
+          discoveryOpen={discoveryOpen && !workspace.preferences.translationViewOpen}
           onToggleDiscovery={() => setDiscoveryOpen((value) => !value)}
           onToggleLeft={() => setLeftOpen((value) => !value)}
           onToggleRight={() => setRightOpen((value) => !value)}
@@ -775,6 +902,10 @@ function WhalePaperApp() {
           onThemeChange={(theme) => setWorkspace((current) => ({ ...current, preferences: { ...current.preferences, theme } }))}
           onModeChange={setReaderMode}
           onTranslatePage={() => {
+            // Translation is a reading view. Release the auxiliary panels so
+            // the PDF and paragraph-level translation both retain real width.
+            setLeftOpen(false);
+            setRightOpen(false);
             setWorkspace((current) => ({ ...current, preferences: { ...current.preferences, translationViewOpen: true } }));
             void translatePage(currentPage);
           }}
@@ -784,17 +915,35 @@ function WhalePaperApp() {
           onSearch={() => { setLeftOpen(true); setLeftTab("search"); }}
         />
 
-        <Document
+        {pdfLoadFailure ? (
+          <div className="document-error">
+            <h2>{pdfLoadFailure === "timeout" ? "PDF 解析超时" : "无法读取 PDF"}</h2>
+            <p>{error || "文件可能不完整，或 PDF.js 工作线程未响应。"}</p>
+            <div className="document-error-actions">
+              <button className="primary-button compact" type="button" onClick={() => file && loadFile({ ...file, data: file.data.slice() })}>重试解析</button>
+              <button className="secondary-button compact" type="button" onClick={() => void chooseFile()}>打开其他文件</button>
+            </div>
+          </div>
+        ) : <Document
           className="reader-document"
+          key={`${file.name}:${file.data.byteLength}:${file.sourcePath || ""}`}
           file={source}
+          onLoadProgress={({ loaded, total }) => setPdfLoadProgress({ loaded, total })}
           onLoadSuccess={(proxy) => void handleDocumentLoad(proxy)}
-          onLoadError={(loadError) => setError(loadError.message)}
-          loading={<div className="document-loading"><span /><p>正在解析 PDF...</p></div>}
+          onLoadError={(loadError) => {
+            if (pdfLoadTimerRef.current !== null) {
+              window.clearTimeout(pdfLoadTimerRef.current);
+              pdfLoadTimerRef.current = null;
+            }
+            setPdfLoadFailure("error");
+            setError(loadError instanceof Error ? loadError.message : "PDF 文件可能已损坏或受到密码保护。");
+          }}
+          loading={<div className="document-loading"><span /><p>{pdfLoadProgress?.total ? `正在解析 PDF… ${Math.round((pdfLoadProgress.loaded / pdfLoadProgress.total) * 100)}%` : "正在解析 PDF…"}</p></div>}
           error={<div className="document-error"><h2>无法读取 PDF</h2><p>{error || "文件可能已损坏或受到密码保护。"}</p><button className="primary-button compact" type="button" onClick={() => void chooseFile()}>打开其他文件</button></div>}
         >
           {document && (
-            <div className="reader-body">
-            {leftOpen && (
+            <div className={`reader-body${workspace.preferences.translationViewOpen ? " is-translation-view" : ""}`}>
+            {leftOpen && !workspace.preferences.translationViewOpen && (
               <LeftSidebar
                 pdf={document.proxy}
                 activeTab={leftTab}
@@ -807,6 +956,7 @@ function WhalePaperApp() {
                 onQueryChange={setQuery}
                 searchHits={searchHits}
                 indexProgress={indexProgress}
+                indexError={textExtractionError}
                 onNavigate={navigate}
                 onClose={() => setLeftOpen(false)}
               />
@@ -864,6 +1014,7 @@ function WhalePaperApp() {
               activeTranslationSegmentId={activeTranslationSegmentId}
               onTranslationSegmentActivate={(segment) => setActiveTranslationSegmentId(segment.id)}
               onTranslationRectsChange={updateTranslationRects}
+              onVisualRegionsChange={updateTranslationVisualRegions}
             />
               {workspace.preferences.translationViewOpen && (
                 <TranslationPane
@@ -900,7 +1051,8 @@ function WhalePaperApp() {
               {selectionTranslationPopup && (
                 <SelectionTranslationPopup value={selectionTranslationPopup} onClose={() => setSelectionTranslationPopup(null)} />
               )}
-              <div className={`reader-right-shell ${rightOpen ? "is-open" : ""}`}>
+              {!workspace.preferences.translationViewOpen && (
+                <div className={`reader-right-shell ${rightOpen ? "is-open" : ""}`}>
                 {rightOpen && (
                   <RightPanel
                     document={document}
@@ -954,10 +1106,11 @@ function WhalePaperApp() {
                   }}
                   onToggle={() => setRightOpen((value) => !value)}
                 />
-              </div>
+                </div>
+              )}
             </div>
           )}
-        </Document>
+        </Document>}
       </div>
 
       <SettingsDialog

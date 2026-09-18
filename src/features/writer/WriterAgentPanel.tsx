@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Bot, Check, ChevronDown, Code2, FileCode2, FolderOpen, LoaderCircle, LockKeyhole, Plus, SearchCheck, Send, Settings, WandSparkles, X } from "lucide-react";
 import type { WriterProject } from "./types";
-import type { AgentAccessMode, AgentRuntimeId as SettingsAgentRuntimeId, AgentThirdPartyConfig } from "../../types";
+import type { AgentAccessMode, AgentPaths, AgentRuntimeId as SettingsAgentRuntimeId, AgentThirdPartyConfig } from "../../types";
 import { getAgentModelList, getAgentRuntimeStatus, listAgentMessages, listUserMemories, runWriterAgent, saveAgentMessage, saveUserMemory, stopWriterAgent, type AgentFileChange, type AgentModelInfo, type AgentRuntimeId, type AgentRuntimeInfo, type UserMemory } from "./services/agent";
 import { MarkdownContent } from "../../components/MarkdownContent";
 
@@ -19,6 +19,7 @@ type WriterAgentPanelProps = {
   activePath: string | null;
   defaultRuntime?: SettingsAgentRuntimeId;
   agentAccess?: Partial<Record<SettingsAgentRuntimeId, AgentAccessMode>>;
+  agentPaths?: AgentPaths;
   agentThirdParty?: Partial<Record<SettingsAgentRuntimeId, AgentThirdPartyConfig>>;
   configuredModels?: string[];
   files: Record<string, string>;
@@ -112,11 +113,11 @@ export function WriterAgentPanel(props: WriterAgentPanelProps) {
 
   const refreshRuntimeStatus = () => {
     setRuntimeStatus("loading");
-    void getAgentRuntimeStatus()
+    void getAgentRuntimeStatus({ paths: props.agentPaths })
       .then((next) => { setRuntimes(next); setRuntimeStatus("ready"); })
       .catch(() => { setRuntimes([]); setRuntimeStatus("error"); });
   };
-  useEffect(() => { refreshRuntimeStatus(); }, []);
+  useEffect(() => { refreshRuntimeStatus(); }, [props.agentPaths?.claude_code, props.agentPaths?.codex_runtime]);
   useEffect(() => {
     let cancelled = false;
     void listAgentMessages(sessionId).then((stored) => {
@@ -180,7 +181,7 @@ export function WriterAgentPanel(props: WriterAgentPanelProps) {
       return () => { cancelled = true; };
     }
     setModels([]);
-    void getAgentModelList(runtime, { accessMode, thirdParty: thirdPartyConfig }).then((next) => {
+    void getAgentModelList(runtime, { accessMode, thirdParty: thirdPartyConfig, cliPath: props.agentPaths?.[runtime] }).then((next) => {
       if (!cancelled && next.length) setModels(next);
     }).catch(() => {
       // Keep the runtime-specific fallback list when the provider is offline.
@@ -299,6 +300,7 @@ export function WriterAgentPanel(props: WriterAgentPanelProps) {
         permissionMode: options.permissionMode || permissionMode,
         accessMode,
         thirdParty: thirdPartyConfig,
+        cliPath: props.agentPaths?.[runtime],
         skill: options.skill,
         prompt: instruction,
       });

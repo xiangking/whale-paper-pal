@@ -4,10 +4,34 @@ import { IconButton } from "./IconButton";
 import { useResizablePanel } from "./useResizablePanel";
 import { useEffect, useRef } from "react";
 
-const TRANSLATION_PANEL_STORAGE_KEY = "whale-paper:translation-panel-width";
+// A separate key prevents a width saved by the old three-panel reader from
+// making the focused translation view start with an unusably wide pane.
+const TRANSLATION_PANEL_STORAGE_KEY = "whale-paper:translation-panel-width-v2";
+const LINK_PATTERN = /(https?:\/\/[^\s<>'"，。；！？）】]+|www\.[^\s<>'"，。；！？）】]+|(?:doi:\s*)?10\.\d{4,9}\/[\w.()/:;+-]+|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})/gi;
+
+function renderRichText(value: string) {
+  return value.split(LINK_PATTERN).map((part, index) => {
+    const isLink = /^(?:https?:\/\/|www\.|doi:\s*10\.\d{4,9}\/|10\.\d{4,9}\/|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})/i.test(part);
+    if (!part || !isLink) return <span key={`${part}-${index}`}>{part}</span>;
+    const href = part.includes("@") && !/^https?:/i.test(part)
+      ? `mailto:${part}`
+      : /^10\.\d{4,9}\//i.test(part) || /^doi:/i.test(part)
+        ? `https://doi.org/${part.replace(/^doi:\s*/i, "")}`
+        : /^www\./i.test(part) ? `https://${part}` : part;
+    return <a key={`${part}-${index}`} href={href} target="_blank" rel="noreferrer">{part}</a>;
+  });
+}
 
 function translationPanelMaxWidth(panel: HTMLElement): number {
-  return Math.min(1000, (panel.parentElement?.clientWidth || window.innerWidth) - 200);
+  const parentWidth = panel.parentElement?.clientWidth || window.innerWidth;
+  // Keep a usable reading canvas beside the translation pane. The old
+  // persisted width could consume most of the window and make a two-column
+  // PDF look like a narrow vertical page.
+  return Math.max(300, Math.min(
+    620,
+    Math.floor(window.innerWidth * 0.44),
+    parentWidth - 520,
+  ));
 }
 
 type TranslationPaneProps = {
@@ -28,10 +52,10 @@ type TranslationPaneProps = {
 };
 
 export function TranslationPane(props: TranslationPaneProps) {
-  const segmentRefs = useRef(new Map<string, HTMLSpanElement>());
+  const segmentRefs = useRef(new Map<string, HTMLDivElement>());
   const translationPanelResize = useResizablePanel({
     storageKey: TRANSLATION_PANEL_STORAGE_KEY,
-    defaultWidth: 400,
+    defaultWidth: 440,
     minWidth: 300,
     edge: "left",
     label: "调整对照翻译栏宽度",
@@ -42,6 +66,15 @@ export function TranslationPane(props: TranslationPaneProps) {
     if (!props.activeSegmentId) return;
     segmentRefs.current.get(props.activeSegmentId)?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [props.activeSegmentId]);
+  const segments = props.translation?.segments || [];
+  const specialCount = segments.filter((segment) => segment.kind && segment.kind !== "text").length;
+  const kindLabel: Record<NonNullable<TranslationSegment["kind"]>, string> = {
+    text: "译文",
+    "figure-caption": "图题",
+    table: "表题",
+    formula: "公式说明",
+    footnote: "脚注",
+  };
 
   return (
     <aside ref={translationPanelResize.panelRef} className="translation-pane" style={translationPanelResize.panelStyle}>
@@ -88,27 +121,36 @@ export function TranslationPane(props: TranslationPaneProps) {
       )}
       {props.translation ? (
         <article className="translation-content" style={{ fontSize: props.fontSize }}>
-          <div><span>{props.translation.sourceLanguage}</span><b>→</b><span>{props.translation.targetLanguage}</span></div>
-          {props.translation.segments?.length ? (
-            <div className="translation-segments">
-              {props.translation.segments.map((segment) => (
-                <span
-                  key={segment.id}
-                  ref={(element) => {
-                    if (element) segmentRefs.current.set(segment.id, element);
-                    else segmentRefs.current.delete(segment.id);
-                  }}
-                  className={`translation-segment ${props.activeSegmentId === segment.id ? "is-active" : ""}`}
-                  onMouseEnter={() => props.onSegmentActivate(segment, false)}
-                  onFocus={() => props.onSegmentActivate(segment, false)}
-                  onClick={() => props.onSegmentActivate(segment, true)}
-                  tabIndex={0}
-                >
-                  {segment.targetText}{" "}
-                </span>
-              ))}
-            </div>
-          ) : <p>{props.translation.content}</p>}
+          <div className="translation-language-pair"><span>{props.translation.sourceLanguage}</span><b>→</b><span>{props.translation.targetLanguage}</span></div>
+          <div className="translation-layout-hint">按阅读顺序整段翻译，保留标题、图表说明、公式和脚注；图片见左侧原文。</div>
+          {specialCount > 0 && <div className="translation-layout-note"><span>图表与注释</span><small>{specialCount} 组译文</small></div>}
+          <div className="translation-block-list">
+            {segments.length ? segments.map((segment) => {
+              const kind = segment.kind || "text";
+              return (
+                <section key={segment.id} className={`translation-block translation-block-${kind}`}>
+                  {kind !== "text" && <div className="translation-block-heading">{kindLabel[kind]}</div>}
+                  <div
+                    ref={(element) => {
+                      if (element) segmentRefs.current.set(segment.id, element);
+                      else segmentRefs.current.delete(segment.id);
+                    }}
+                    className={`translation-block-target translation-segment ${props.activeSegmentId === segment.id ? "is-active" : ""}`}
+                    onMouseEnter={() => props.onSegmentActivate(segment, false)}
+                    onFocus={() => props.onSegmentActivate(segment, false)}
+                    onClick={() => props.onSegmentActivate(segment, true)}
+                    tabIndex={0}
+                  >
+                    {renderRichText(segment.targetText)}
+                  </div>
+                </section>
+              );
+            }) : (
+              <section className="translation-block translation-block-text">
+                <p className="translation-block-target">{renderRichText(props.translation.content)}</p>
+              </section>
+            )}
+          </div>
           <time>{new Date(props.translation.updatedAt).toLocaleString()}</time>
         </article>
       ) : props.loading ? (
