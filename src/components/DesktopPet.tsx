@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { BookOpen, LogOut, MessageSquare, Minus, Plus, Settings, Trash2, X } from "lucide-react";
+import { BookOpen, LogOut, MessageSquare, Minimize2, Minus, Plus, Settings, Trash2, X } from "lucide-react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { LogicalSize, PhysicalPosition } from "@tauri-apps/api/dpi";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -146,8 +146,8 @@ export function DesktopPet() {
     if (!petWindow) return;
     const base = DESKTOP_PET_WINDOW_SIZES[settings.windowSize];
     const spriteOnlyHeight = Math.round(238 * settings.avatarScale);
-    void resizePetWindow({ width: base.width, height: chatCollapsed ? spriteOnlyHeight : base.height });
-  }, [chatCollapsed, petWindow, resizePetWindow, settings.avatarScale, settings.windowSize]);
+    void resizePetWindow({ width: base.width, height: chatCollapsed && !menuOpen ? spriteOnlyHeight : base.height });
+  }, [chatCollapsed, menuOpen, petWindow, resizePetWindow, settings.avatarScale, settings.windowSize]);
 
   const applyWindowSettings = useCallback(async (next: DesktopPetSettings, resetPosition = false) => {
     setSettings(next);
@@ -334,6 +334,21 @@ export function DesktopPet() {
     await petWindow.emitTo("main", "open-desktop-pet-settings");
   };
 
+  const collapsePet = async () => {
+    const next = { ...settings, enabled: false };
+    const allSettings = loadAiSettings();
+    stopChatMessage();
+    setMenuOpen(false);
+    setSettings(next);
+    saveAiSettings({ ...allSettings, desktopPet: next });
+    if (!petWindow) return;
+    try {
+      await petWindow.emitTo("main", "desktop-pet-settings-updated", next);
+    } finally {
+      await petWindow.hide();
+    }
+  };
+
   const changeAvatarScale = (direction: -1 | 1) => {
     const scales = [0.75, 1, 1.15];
     const currentIndex = scales.findIndex((scale) => Math.abs(scale - settings.avatarScale) < 0.01);
@@ -461,6 +476,7 @@ export function DesktopPet() {
           <button type="button" disabled={settings.avatarScale <= 0.75} onClick={() => changeAvatarScale(-1)}><Minus size={14} />缩小精灵</button>
           <button type="button" disabled={settings.avatarScale >= 1.15} onClick={() => changeAvatarScale(1)}><Plus size={14} />放大精灵</button>
           <button type="button" onClick={() => void openPetSettings()}><Settings size={14} />桌宠设置</button>
+          <button type="button" onClick={() => void collapsePet()}><Minimize2 size={14} />收起精灵</button>
           <button type="button" onClick={() => { if (petWindow) void invoke("quit_app"); }}><LogOut size={14} />退出 WhalePaper</button>
         </div>
       )}
