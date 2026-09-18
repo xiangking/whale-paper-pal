@@ -24,6 +24,7 @@ type LeftSidebarProps = {
   onQueryChange: (query: string) => void;
   searchHits: SearchHit[];
   indexProgress: number;
+  indexError?: string;
   onNavigate: (page: number) => void;
   onClose: () => void;
 };
@@ -206,6 +207,7 @@ export function LeftSidebar(props: LeftSidebarProps) {
             {props.query && <button type="button" aria-label="清空搜索" onClick={() => props.onQueryChange("")}><X size={14} /></button>}
           </label>
           {props.indexProgress < props.pageCount && <p className="index-progress">正在索引 {props.indexProgress}/{props.pageCount} 页</p>}
+          {props.indexError && <p className="index-progress" role="status">部分页面文字读取失败：{props.indexError}</p>}
           {props.query && props.indexProgress === props.pageCount && (
             <p className="result-count">{props.searchHits.reduce((sum, hit) => sum + hit.count, 0)} 个结果，分布在 {props.searchHits.length} 页</p>
           )}

@@ -1384,6 +1384,7 @@ export function WritingWorkspace({ rootPath, initialFile, aiSettings, onClose, o
             activePath={activePath}
             defaultRuntime={aiSettings.agentRuntime}
             agentAccess={aiSettings.agentAccess}
+            agentPaths={aiSettings.agentPaths}
             agentThirdParty={aiSettings.agentThirdParty}
             configuredModels={aiSettings.availableModels}
             files={Object.fromEntries(Object.entries(buffers).map(([path, buffer]) => [path, buffer.content]))}

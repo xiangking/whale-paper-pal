@@ -1,5 +1,5 @@
 import { PDFDocument, rgb } from "pdf-lib";
-import type { Annotation, DocumentWorkspace, ExplanationRecord, PaperComment, PaperReview, PdfDocumentState } from "../types";
+import type { Annotation, DocumentWorkspace, ExplanationRecord, PaperComment, PaperReview, PaperReviewPoint, PdfDocumentState } from "../types";
 
 const HIGHLIGHT_COLORS = {
   yellow: "#f6cf4a",
@@ -73,7 +73,13 @@ export function createCommentsCsv(comments: PaperComment[]): string {
 }
 
 export function createPaperReviewMarkdown(review: PaperReview, title = "论文深度解读"): string {
-  const pointSection = (heading: string, points: PaperReview["strengths"]) => [
+  if ("overviewMarkdown" in review) {
+    return [`# ${title}`, review.overviewMarkdown, review.methodMarkdown, review.analysisMarkdown]
+      .map((section) => section.trim())
+      .filter(Boolean)
+      .join("\n\n").concat("\n");
+  }
+  const pointSection = (heading: string, points: PaperReviewPoint[]) => [
     `## ${heading}`,
     ...points.flatMap((point, index) => [
       `### ${index + 1}. ${point.title}`,

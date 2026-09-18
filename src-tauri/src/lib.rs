@@ -8,12 +8,13 @@ use base64::Engine;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
+use wait_timeout::ChildExt;
 
 static ACTIVE_AGENT_PID: AtomicI32 = AtomicI32::new(0);
 static ACTIVE_AGENT_SESSION: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -58,6 +59,8 @@ struct WriterAgentRequest {
     #[serde(default)]
     third_party: Option<AgentThirdPartyConfig>,
     #[serde(default)]
+    cli_path: Option<String>,
+    #[serde(default)]
     skill: Option<String>,
     prompt: String,
 }
@@ -80,6 +83,17 @@ struct AgentModelListRequest {
     access_mode: Option<String>,
     #[serde(default)]
     third_party: Option<AgentThirdPartyConfig>,
+    #[serde(default)]
+    cli_path: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AgentRuntimeStatusRequest {
+    #[serde(default)]
+    paths: HashMap<String, String>,
+    #[serde(default)]
+    refresh: bool,
 }
 
 fn dream_worker(app: tauri::AppHandle) {
@@ -101,6 +115,7 @@ fn dream_worker(app: tauri::AppHandle) {
             permission_mode: Some("plan".to_string()),
             access_mode: Some("direct".to_string()),
             third_party: None,
+            cli_path: None,
             skill: None,
             prompt: format!("请根据以下近期会话信号，整理一份简洁的长期用户画像。只保留对未来协作有帮助且不敏感的信息，不要修改项目文件。\n\n{}", context),
         };
@@ -280,67 +295,267 @@ struct AgentModelInfo {
     context_window: Option<u32>,
 }
 
+static AGENT_BINARY_CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+
+fn agent_command(path: &Path) -> Command {
+    #[cfg(windows)]
+    if matches!(
+        path.extension().and_then(|value| value.to_str()),
+        Some("cmd") | Some("bat")
+    ) {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/C"]).arg(path);
+        return command;
+    }
+    Command::new(path)
+}
+
+fn push_unique(candidates: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !candidates.iter().any(|item| item == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn executable_variants(path: PathBuf) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let mut variants = vec![path.clone()];
+        if path.extension().is_none() {
+            variants.extend([
+                path.with_extension("exe"),
+                path.with_extension("cmd"),
+                path.with_extension("bat"),
+            ]);
+        }
+        return variants;
+    }
+    vec![path]
+}
+
 fn executable_candidates(name: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    let add = |candidates: &mut Vec<PathBuf>, path: PathBuf| {
+        for variant in executable_variants(path) {
+            push_unique(candidates, variant);
+        }
+    };
+
+    #[cfg(target_os = "macos")]
     if name == "codex" {
-        // ChatGPT.app is the primary Codex Runtime on the desktop. Prefer its
+        // ChatGPT.app is the primary Codex Runtime on macOS. Prefer its
         // bundled binary over PATH entries such as a stale Homebrew shim.
-        candidates.extend([
+        add(
+            &mut candidates,
             PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
+        );
+        add(
+            &mut candidates,
             PathBuf::from("/Applications/Codex.app/Contents/Resources/codex"),
-        ]);
+        );
     }
-    if let Ok(path) = std::env::var("PATH") {
-        candidates.extend(path.split(':').map(|entry| Path::new(entry).join(name)));
+
+    // split_paths handles ':' on Unix and ';' on Windows, including quoted
+    // or platform-specific path syntax.
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            add(&mut candidates, directory.join(name));
+        }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(Path::new(&home).join(".local/bin").join(name));
-        candidates.push(Path::new(&home).join(".claude/bin").join(name));
-        candidates.push(Path::new(&home).join(".bun/bin").join(name));
+
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    if let Some(home) = home.as_ref() {
+        for directory in [".local/bin", ".claude/bin", ".bun/bin"] {
+            add(&mut candidates, home.join(directory).join(name));
+        }
+        #[cfg(windows)]
+        if name == "codex" {
+            add(
+                &mut candidates,
+                home.join("AppData/Local/OpenAI/Codex/bin/codex"),
+            );
+        }
     }
-    candidates.extend([
-        PathBuf::from(format!("/opt/homebrew/bin/{name}")),
-        PathBuf::from(format!("/usr/local/bin/{name}")),
-        PathBuf::from(format!("/usr/bin/{name}")),
-    ]);
+
+    #[cfg(windows)]
+    {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            let codex_bin = local_app_data.join("OpenAI/Codex/bin");
+            add(&mut candidates, codex_bin.join("codex"));
+            // Codex Desktop keeps the executable in a versioned child folder.
+            // Sort the folders so the newest-looking install is tried first.
+            if let Ok(entries) = fs::read_dir(&codex_bin) {
+                let mut directories = entries
+                    .flatten()
+                    .filter_map(|entry| {
+                        entry
+                            .file_type()
+                            .ok()
+                            .filter(|kind| kind.is_dir())
+                            .map(|_| entry.path())
+                    })
+                    .collect::<Vec<_>>();
+                directories.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
+                for directory in directories {
+                    add(&mut candidates, directory.join(name));
+                }
+            }
+            for directory in ["Programs/Claude Code", "Programs/Claude", "Programs"] {
+                add(&mut candidates, local_app_data.join(directory).join(name));
+            }
+        }
+        let roaming_app_data = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|value| value.join("AppData/Roaming")));
+        if let Some(roaming_app_data) = roaming_app_data {
+            add(&mut candidates, roaming_app_data.join("npm").join(name));
+        }
+        // `where.exe` also sees PATH entries inherited by the desktop app,
+        // which may differ from the shell used to launch it.
+        if let Ok(output) = Command::new("where.exe").arg(name).output() {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let path = PathBuf::from(line.trim());
+                if !path.as_os_str().is_empty() {
+                    add(&mut candidates, path);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    for directory in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
+        add(&mut candidates, Path::new(directory).join(name));
+    }
     candidates
 }
 
-fn find_agent_binary(name: &str) -> Option<PathBuf> {
-    executable_candidates(name).into_iter().find(|path| {
-        if !path.is_file() {
-            return false;
+fn configured_executable_candidates(name: &str, configured_path: Option<&str>) -> Vec<PathBuf> {
+    let Some(value) = configured_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+    let path = PathBuf::from(value);
+    let mut candidates = executable_variants(path.clone());
+    if path.extension().is_none() || path.is_dir() {
+        for variant in executable_variants(path.join(name)) {
+            push_unique(&mut candidates, variant);
         }
-        // Homebrew's npm shim can exist while its bundled native Codex binary
-        // is missing. Probe candidates and fall through to ChatGPT.app.
-        if name == "codex" {
-            return std::process::Command::new(path)
-                .arg("--version")
-                .output()
-                .map(|output| output.status.success())
-                .unwrap_or(false);
+    }
+    candidates
+}
+
+const AGENT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run a probe subprocess with bounded execution time. Probe commands such as
+/// `claude --version` or `codex login status` can block on first-run
+/// migrations or network authentication, so a timeout keeps a slow or hung CLI
+/// from occupying its thread indefinitely.
+fn command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_reader = stdout_pipe.map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+            bytes
+        })
+    });
+    let stderr_reader = stderr_pipe.map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+            bytes
+        })
+    });
+    let status = match child.wait_timeout(timeout).ok()? {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
         }
-        true
+    };
+    let stdout = stdout_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_reader
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    Some(std::process::Output {
+        status,
+        stdout,
+        stderr,
     })
 }
 
-fn probe_agent(name: &str, id: &str, label: &str) -> AgentRuntimeInfo {
-    let path = find_agent_binary(name);
-    let version = path.as_ref().and_then(|binary| {
-        std::process::Command::new(binary)
-            .arg("--version")
-            .output()
-            .ok()
-            .and_then(|output| {
-                if output.status.success() {
-                    String::from_utf8(output.stdout)
-                        .ok()
-                        .map(|value| value.trim().to_string())
-                } else {
-                    None
-                }
-            })
-    });
+fn probe_version(path: &Path) -> Option<String> {
+    let output =
+        command_output_with_timeout(agent_command(path).arg("--version"), AGENT_PROBE_TIMEOUT)?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = if output.stdout.is_empty() {
+        &output.stderr
+    } else {
+        &output.stdout
+    };
+    let value = String::from_utf8_lossy(value).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn resolve_agent_binary(
+    name: &str,
+    configured_path: Option<&str>,
+    refresh: bool,
+) -> Option<PathBuf> {
+    let configured = configured_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    let key = format!("{name}\0{configured}");
+    let cache = AGENT_BINARY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().ok()?;
+    if refresh {
+        cache.clear();
+    }
+    if let Some(result) = cache.get(&key) {
+        return result.clone();
+    }
+    // A configured path is authoritative for the first attempt. Only when it
+    // is absent or unusable do we construct and scan the platform candidates.
+    let configured_candidates = configured_executable_candidates(name, Some(configured));
+    let result = configured_candidates
+        .into_iter()
+        .find(|path| path.is_file() && probe_version(path).is_some())
+        .or_else(|| {
+            executable_candidates(name)
+                .into_iter()
+                .find(|path| path.is_file() && probe_version(path).is_some())
+        });
+    cache.insert(key, result.clone());
+    result
+}
+
+fn probe_agent(
+    name: &str,
+    id: &str,
+    label: &str,
+    configured_path: Option<&str>,
+    refresh: bool,
+) -> AgentRuntimeInfo {
+    let path = resolve_agent_binary(name, configured_path, refresh);
+    let version = path.as_ref().and_then(|binary| probe_version(binary));
     let available = path.is_some() && version.is_some();
     let authenticated = path.as_ref().and_then(|binary| {
         let ambient_key_present = if name == "claude" {
@@ -363,9 +578,9 @@ fn probe_agent(name: &str, id: &str, label: &str) -> AgentRuntimeInfo {
                 .ok()
                 .map(|home| Path::new(&home).join("auth.json"))
                 .or_else(|| {
-                    std::env::var("HOME")
-                        .ok()
-                        .map(|home| Path::new(&home).join(".codex/auth.json"))
+                    std::env::var_os("HOME")
+                        .or_else(|| std::env::var_os("USERPROFILE"))
+                        .map(|home| PathBuf::from(home).join(".codex/auth.json"))
                 })
                 .is_some_and(|auth| {
                     auth.is_file() && fs::metadata(auth).is_ok_and(|meta| meta.len() > 0)
@@ -375,15 +590,15 @@ fn probe_agent(name: &str, id: &str, label: &str) -> AgentRuntimeInfo {
             }
         }
         let output = if name == "claude" {
-            std::process::Command::new(binary)
-                .args(["auth", "status", "--json"])
-                .output()
-                .ok()?
+            command_output_with_timeout(
+                agent_command(binary).args(["auth", "status", "--json"]),
+                AGENT_PROBE_TIMEOUT,
+            )?
         } else {
-            std::process::Command::new(binary)
-                .args(["login", "status"])
-                .output()
-                .ok()?
+            command_output_with_timeout(
+                agent_command(binary).args(["login", "status"]),
+                AGENT_PROBE_TIMEOUT,
+            )?
         };
         if !output.status.success() {
             return Some(false);
@@ -407,11 +622,28 @@ fn probe_agent(name: &str, id: &str, label: &str) -> AgentRuntimeInfo {
 }
 
 #[tauri::command]
-fn agent_runtime_status() -> Vec<AgentRuntimeInfo> {
-    vec![
-        probe_agent("claude", "claude_code", "Claude Code"),
-        probe_agent("codex", "codex_runtime", "Codex"),
-    ]
+async fn agent_runtime_status(request: Option<AgentRuntimeStatusRequest>) -> Vec<AgentRuntimeInfo> {
+    let request = request.unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        vec![
+            probe_agent(
+                "claude",
+                "claude_code",
+                "Claude Code",
+                request.paths.get("claude_code").map(String::as_str),
+                request.refresh,
+            ),
+            probe_agent(
+                "codex",
+                "codex_runtime",
+                "Codex",
+                request.paths.get("codex_runtime").map(String::as_str),
+                false,
+            ),
+        ]
+    })
+    .await
+    .unwrap_or_default()
 }
 
 fn claude_model_options() -> Vec<AgentModelInfo> {
@@ -452,10 +684,15 @@ struct CodexModelListResult {
     data: Vec<CodexModelRow>,
 }
 
+fn agent_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
 fn cached_codex_context_window(model_id: &str) -> Option<u32> {
-    let home = std::env::var("HOME").ok()?;
-    let contents =
-        std::fs::read_to_string(Path::new(&home).join(".codex/models_cache.json")).ok()?;
+    let home = agent_home_dir()?;
+    let contents = std::fs::read_to_string(home.join(".codex/models_cache.json")).ok()?;
     let payload = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
     payload
         .get("models")
@@ -477,10 +714,10 @@ fn cached_codex_context_window(model_id: &str) -> Option<u32> {
         })
 }
 
-fn fetch_codex_models() -> Result<Vec<AgentModelInfo>, String> {
-    let path = find_agent_binary("codex")
+fn fetch_codex_models(configured_path: Option<&str>) -> Result<Vec<AgentModelInfo>, String> {
+    let path = resolve_agent_binary("codex", configured_path, false)
         .ok_or_else(|| "未检测到 ChatGPT/Codex 的可用二进制。".to_string())?;
-    let mut child = std::process::Command::new(path)
+    let mut child = agent_command(&path)
         .args(["app-server"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -696,8 +933,10 @@ async fn agent_model_list(request: AgentModelListRequest) -> Result<Vec<AgentMod
         return fetch_third_party_models(&request.runtime, config).await;
     }
     tauri::async_runtime::spawn_blocking(move || match request.runtime.as_str() {
-        "claude_code" => Ok(claude_model_options()),
-        "codex_runtime" => fetch_codex_models(),
+        "claude_code" => resolve_agent_binary("claude", request.cli_path.as_deref(), false)
+            .map(|_| claude_model_options())
+            .ok_or_else(|| "未检测到 Claude Code 的可用二进制。".to_string()),
+        "codex_runtime" => fetch_codex_models(request.cli_path.as_deref()),
         _ => Err("未知 Agent runtime".to_string()),
     })
     .await
@@ -731,9 +970,10 @@ async fn run_writer_agent(
             .or_else(|| third_party.as_ref().map(|config| config.model.clone()));
         let (binary, args): (PathBuf, Vec<String>) = match request.runtime.as_str() {
             "claude_code" => {
-                let path = find_agent_binary("claude").ok_or_else(|| {
-                    "未检测到 Claude Code，请先安装并登录 claude CLI。".to_string()
-                })?;
+                let path = resolve_agent_binary("claude", request.cli_path.as_deref(), false)
+                    .ok_or_else(|| {
+                        "未检测到 Claude Code，请先安装并登录 claude CLI。".to_string()
+                    })?;
                 let mut args = vec![
                     "-p".into(),
                     request.prompt,
@@ -755,9 +995,10 @@ async fn run_writer_agent(
                 (path, args)
             }
             "codex_runtime" => {
-                let path = find_agent_binary("codex").ok_or_else(|| {
-                    "未检测到 Codex，请安装 Codex CLI 或 ChatGPT 桌面版。".to_string()
-                })?;
+                let path = resolve_agent_binary("codex", request.cli_path.as_deref(), false)
+                    .ok_or_else(|| {
+                        "未检测到 Codex，请安装 Codex CLI 或 ChatGPT 桌面版。".to_string()
+                    })?;
                 let prompt = request.prompt;
                 let is_third_party = requested_access_mode.as_deref() == Some("thirdparty");
                 let mut args = vec!["exec".into(), "--json".into()];
@@ -820,7 +1061,7 @@ async fn run_writer_agent(
             }
             _ => return Err("未知 Agent runtime".to_string()),
         };
-        let mut command = std::process::Command::new(&binary);
+        let mut command = agent_command(&binary);
         command
             .args(args)
             .current_dir(&root)
@@ -953,9 +1194,7 @@ async fn run_writer_agent(
 /// discovery path. The prompt stays a normal user turn; no skill text is
 /// concatenated into it by WhalePaper.
 fn install_paper_check_skill(runtime: &str) -> Result<(), String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "无法确定本地 Agent skill 目录。".to_string())?;
+    let home = agent_home_dir().ok_or_else(|| "无法确定本地 Agent skill 目录。".to_string())?;
     let skill_dir = match runtime {
         "claude_code" => home.join(".claude/skills/whalepaper-paper-check"),
         "codex_runtime" => home.join(".codex/skills/whalepaper-paper-check"),
@@ -970,14 +1209,23 @@ fn install_paper_check_skill(runtime: &str) -> Result<(), String> {
 fn stop_writer_agent_process(app: &tauri::AppHandle) {
     let pid = ACTIVE_AGENT_PID.swap(0, Ordering::SeqCst);
     if pid > 0 {
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
-        // Claude/Codex can spawn helper processes; terminate direct children
-        // as well so a stopped request cannot keep consuming provider tokens.
-        let _ = std::process::Command::new("pkill")
-            .args(["-TERM", "-P", &pid.to_string()])
-            .status();
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill.exe")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .status();
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+            // Claude/Codex can spawn helper processes; terminate direct children
+            // as well so a stopped request cannot keep consuming provider tokens.
+            let _ = std::process::Command::new("pkill")
+                .args(["-TERM", "-P", &pid.to_string()])
+                .status();
+        }
     }
     if let Some(session) = ACTIVE_AGENT_SESSION
         .get()
@@ -1042,10 +1290,10 @@ fn environment_proxy_configured() -> bool {
 
 #[cfg(target_os = "macos")]
 fn macos_system_proxy() -> Option<String> {
-    let output = std::process::Command::new("/usr/sbin/scutil")
-        .arg("--proxy")
-        .output()
-        .ok()?;
+    let output = command_output_with_timeout(
+        std::process::Command::new("/usr/sbin/scutil").arg("--proxy"),
+        Duration::from_secs(2),
+    )?;
     if !output.status.success() {
         return None;
     }
@@ -1295,6 +1543,114 @@ mod tests {
     }
 
     #[test]
+    fn command_output_with_timeout_returns_output_of_fast_command() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("printf hello");
+        let output = command_output_with_timeout(&mut command, Duration::from_secs(5))
+            .expect("fast command should finish within the timeout");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "hello");
+    }
+
+    #[test]
+    fn command_output_with_timeout_kills_a_hung_child() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("sleep 30");
+        let started = std::time::Instant::now();
+        let output = command_output_with_timeout(&mut command, Duration::from_millis(300));
+        let elapsed = started.elapsed();
+        assert!(output.is_none(), "a timed-out probe must report no output");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the helper must return promptly instead of waiting for the child, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn command_output_with_timeout_does_not_deadlock_on_large_piped_output() {
+        // More than a pipe buffer held in both stdout and stderr: if the pipes
+        // were drained only after the child exits, this would block forever.
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            "head -c 200000 /dev/zero | tr '\\0' 'a'; head -c 200000 /dev/zero | tr '\\0' 'b' 1>&2",
+        );
+        let output = command_output_with_timeout(&mut command, Duration::from_secs(10))
+            .expect("a command with large piped output must not deadlock");
+        assert_eq!(output.stdout.len(), 200000);
+        assert_eq!(output.stderr.len(), 200000);
+    }
+
+    #[test]
+    fn a_hanging_configured_cli_is_rejected_within_the_probe_timeout() {
+        // Reproduces the original freeze shape: a `claude` binary that blocks
+        // forever. `resolve_agent_binary` screens the configured path with
+        // `probe_version`, which is where the hang used to strand the caller.
+        //
+        // The decisive property is that the screen gives up at
+        // AGENT_PROBE_TIMEOUT instead of waiting on the child forever; that is
+        // what keeps `agent_runtime_status` from freezing its thread. Whether a
+        // working CLI also exists on PATH is a separate concern and is not what
+        // this test pins down.
+        let dir = std::env::temp_dir().join(format!("whalepaper-probe-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let hang = dir.join("claude");
+        fs::write(&hang, "#!/bin/sh\nsleep 60\n").expect("write fake claude");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hang, fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        let started = std::time::Instant::now();
+        let version = probe_version(&hang);
+        let elapsed = started.elapsed();
+
+        assert!(
+            version.is_none(),
+            "a CLI that only hangs reports no version"
+        );
+        assert!(
+            elapsed < AGENT_PROBE_TIMEOUT + Duration::from_secs(15),
+            "screening a hung CLI must stop at the timeout, took {elapsed:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocking_work_runs_off_the_calling_thread() {
+        // The freeze came from blocking work executing on the caller. This
+        // pins the structural fix: `spawn_blocking` hands the closure to a
+        // pool thread, so the future can make progress while it runs. We use
+        // the same construction `agent_runtime_status` relies on.
+        use std::sync::mpsc;
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let watcher = std::thread::spawn(move || {
+            // The pool thread parks until this test releases it.
+            tauri::async_runtime::block_on(async move {
+                tauri::async_runtime::spawn_blocking(move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                    "probe done"
+                })
+                .await
+                .expect("blocking task should join")
+            })
+        });
+
+        // If the work really moved off the calling thread, it starts even
+        // though this test thread has not run anything yet.
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocking work must start on the pool without the caller driving it");
+
+        let _ = release_tx.send(());
+        assert_eq!(watcher.join().expect("watcher thread"), "probe done");
+    }
+
+    #[test]
     fn prefers_structured_codex_turn_error_over_plugin_warnings() {
         let stdout = r#"
 {"type":"turn.started"}
@@ -1365,7 +1721,7 @@ mod tests {
         tauri::async_runtime::block_on(async {
             let response = build_http_client()
                 .expect("desktop HTTP client should initialize")
-                .get("https://www.themoonlight.io/api/scholar/anonymous/search-with-ref?query=Solar%20Open%202%20Technical%20Report")
+                .get("https://api.themoonlight.io/api/scholar/anonymous/search-with-ref?query=Solar%20Open%202%20Technical%20Report")
                 .send()
                 .await
                 .expect("Moonlight request should complete");

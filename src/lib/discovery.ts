@@ -86,7 +86,10 @@ type HuggingFaceDailyItem = HuggingFacePaper & {
   submittedOnDailyAt?: string;
 };
 
-const MOONLIGHT_API = "https://www.themoonlight.io/api";
+// Moonlight's web frontend is hosted on www.themoonlight.io, but its JSON API
+// is served from a separate Express origin. The old www host is protected by
+// Vercel's browser challenge and returns HTML/429 to native clients.
+const MOONLIGHT_API = "https://api.themoonlight.io/api";
 const SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1";
 const HUGGING_FACE_DAILY_API = "https://huggingface.co/api/daily_papers";
 const MATCH_SCORE_KEY = "whalepaper.discovery-match-scores.v1";
@@ -158,13 +161,30 @@ async function requestJson<T>(url: string, headers: Record<string, string> = {})
         ? url.replace(SEMANTIC_SCHOLAR_API, "/semantic-scholar-api")
         : url === HUGGING_FACE_DAILY_API
           ? "/huggingface-api/daily_papers"
-      : url;
+          : url.startsWith(ARXIV_API)
+            ? url.replace(ARXIV_API, "/arxiv-api")
+            : url;
     const response = await fetch(browserUrl, { headers: { Accept: "application/json", ...headers } });
     status = response.status;
     body = await response.text();
   }
   if (status < 200 || status >= 300) throw new Error(`论文推荐服务返回 ${status}`);
   return JSON.parse(body) as T;
+}
+
+async function requestText(url: string, headers: Record<string, string> = {}): Promise<string> {
+  const mergedHeaders = { Accept: "application/atom+xml, application/xml, text/xml, */*", ...headers };
+  if (isTauri()) {
+    const response = await invoke<DesktopHttpResponse>("ai_http_request", {
+      request: { url, method: "GET", headers: mergedHeaders },
+    });
+    if (response.status < 200 || response.status >= 300) throw new Error(`论文推荐服务返回 ${response.status}`);
+    return response.body;
+  }
+  const browserUrl = url.startsWith(ARXIV_API) ? url.replace(ARXIV_API, "/arxiv-api") : url;
+  const response = await fetch(browserUrl, { headers: mergedHeaders });
+  if (!response.ok) throw new Error(`论文推荐服务返回 ${response.status}`);
+  return response.text();
 }
 
 function huggingFacePaper(item: HuggingFaceDailyItem): DiscoveryPaper | null {
@@ -341,9 +361,7 @@ async function loadOpenAlexRelated(title: string): Promise<DiscoveryPaper[]> {
 
 async function loadArxivSearch(query: string): Promise<DiscoveryPaper[]> {
   const url = `${ARXIV_API}?search_query=all:${encodeURIComponent(query)}&start=0&max_results=20&sortBy=relevance`;
-  const response = await fetch(url, { headers: { Accept: "application/atom+xml" } });
-  if (!response.ok) throw new Error(`arXiv 返回 ${response.status}`);
-  const xml = await response.text();
+  const xml = await requestText(url);
   return [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].flatMap((match) => {
     const block = match[1];
     const read = (tag: string) => (block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`))?.[1] || "").replace(/<!\[CDATA\[|\]\]>/g, "").trim();
@@ -357,7 +375,11 @@ async function loadArxivSearch(query: string): Promise<DiscoveryPaper[]> {
 }
 
 export async function searchPapers(query: string): Promise<DiscoveryPaper[]> {
-  const requests = await Promise.allSettled([loadArxivSearch(query), loadOpenAlexRelated(query), loadSemanticScholarRelated(query, "")]);
+  const requests = await Promise.allSettled([
+    settleWithin(loadMoonlightRelated(query), 6_000),
+    settleWithin(loadOpenAlexRelated(query), 6_000),
+    settleWithin(loadArxivSearch(query), 6_000),
+  ]);
   return mergeRelatedPapers("", requests.flatMap((r) => r.status === "fulfilled" ? [r.value] : []));
 }
 
@@ -401,8 +423,8 @@ async function loadMoonlightRelated(title: string): Promise<DiscoveryPaper[]> {
         // Search results below are the closest Moonlight fallback when a review is unavailable.
       }
     }
-  } catch {
-    return [];
+  } catch (error) {
+    throw error;
   }
   return searchCandidates;
 }
@@ -426,9 +448,12 @@ async function requestRelatedPapers(title: string, semanticScholarApiKey: string
     loadMoonlightRelated(title),
     ...(semanticScholarApiKey.trim() ? [loadSemanticScholarRelated(title, semanticScholarApiKey)] : []),
     loadOpenAlexRelated(title),
-  ];
+    loadArxivSearch(title),
+  ].map((request) => settleWithin(request, 6_000));
   const requests = await Promise.allSettled(providers);
-  const sources = requests.map((request) => request.status === "fulfilled" ? request.value : []);
+  const successful = requests.filter((request) => request.status === "fulfilled");
+  if (!successful.length) throw new Error("论文推荐服务暂时不可用");
+  const sources = successful.map((request) => request.value);
   return mergeRelatedPapers(title, sources);
 }
 
@@ -438,10 +463,15 @@ export function loadRelatedPapers(title: string, semanticScholarApiKey = ""): Pr
   const key = `${normalizeTitle(title)}:${keyHash}`;
   const existing = relatedRequests.get(key);
   if (existing) return existing;
-  const request = requestRelatedPapers(title, semanticScholarApiKey).catch((error) => {
-    relatedRequests.delete(key);
-    throw error;
-  });
+  const request = requestRelatedPapers(title, semanticScholarApiKey)
+    .then((papers) => {
+      if (!papers.length) relatedRequests.delete(key);
+      return papers;
+    })
+    .catch((error) => {
+      relatedRequests.delete(key);
+      throw error;
+    });
   relatedRequests.set(key, request);
   return request;
 }

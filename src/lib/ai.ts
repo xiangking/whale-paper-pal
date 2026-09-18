@@ -24,13 +24,19 @@ export type AiRequestOptions = {
   maxOutputTokens?: number;
   temperature?: number;
   jsonResponse?: boolean;
+  /** Internal fallback for reasoning models that spend the whole budget thinking. */
+  disableReasoning?: boolean;
+  /** Internal model fallback used when a reasoning model exhausts its budget. */
+  modelOverride?: string;
+  /** Let the provider choose its own output limit for this request. */
+  omitMaxOutputTokens?: boolean;
 };
 
 export const AI_PROVIDER_PRESETS: AiProviderPreset[] = [
   { id: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1", models: ["gpt-5-nano", "gpt-5-mini", "gpt-4.1-mini"], apiKeyRequired: true, apiKeyPlaceholder: "sk-..." },
   { id: "anthropic", label: "Anthropic", baseUrl: "https://api.anthropic.com/v1", models: ["claude-sonnet-4-5", "claude-haiku-4-5"], apiKeyRequired: true, apiKeyPlaceholder: "sk-ant-..." },
   { id: "gemini", label: "Google Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta", models: ["gemini-2.5-flash", "gemini-2.5-pro"], apiKeyRequired: true, apiKeyPlaceholder: "AIza..." },
-  { id: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com", models: ["deepseek-chat", "deepseek-reasoner"], apiKeyRequired: true, apiKeyPlaceholder: "sk-..." },
+  { id: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com", models: ["deepseek-flash", "deepseek-pro"], apiKeyRequired: true, apiKeyPlaceholder: "sk-..." },
   { id: "moonshot", label: "Moonshot / Kimi", baseUrl: "https://api.moonshot.cn/v1", models: ["kimi-k2-turbo-preview", "moonshot-v1-32k"], apiKeyRequired: true, apiKeyPlaceholder: "sk-..." },
   { id: "qwen", label: "通义千问", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", models: ["qwen-plus", "qwen-turbo", "qwen-max"], apiKeyRequired: true, apiKeyPlaceholder: "sk-..." },
   { id: "ollama", label: "Ollama（本地）", baseUrl: "http://127.0.0.1:11434/v1", models: ["qwen3:8b", "deepseek-r1:8b", "llama3.2"], apiKeyRequired: false, apiKeyPlaceholder: "本地服务无需填写" },
@@ -58,7 +64,7 @@ export const AI_FEATURE_PROMPTS = {
     "优点和局限都要说明论文内依据及其对理解和使用结论的影响。可复现性应检查代码、数据、参数、实现细节和计算资源是否充分。文献定位只能依据论文自己的相关工作部分，无法外部核实时必须说明。",
     "最后提炼读者真正应该带走的结论、适用条件和使用时需要注意的边界。",
   ].join("\n"),
-  translation: "将内容准确翻译成简体中文，保留标题层级、专业术语、数学符号和引用编号。保持原文句子和段落顺序，尽量让每个原文句子对应一个译句，不要合并或拆分句子。",
+  translation: "将内容准确翻译成简体中文，按完整段落和上下文组织自然译文，保留标题层级、专业术语、数学符号和引用编号。保持原文段落顺序，避免把连续正文拆成逐句列表。",
 } as const;
 
 const LEGACY_DEFAULT_AI_PROMPTS: Record<string, string> = {
@@ -75,6 +81,7 @@ export function personalizedPrompt(basePrompt: string, customPrompt?: string): s
 export const DEFAULT_AI_SETTINGS: AiSettings = {
   agentRuntime: "claude_code",
   agentAccess: { claude_code: "direct", codex_runtime: "direct" },
+  agentPaths: {},
   agentThirdParty: {},
   provider: "ollama",
   baseUrl: "http://127.0.0.1:11434/v1",
@@ -168,6 +175,13 @@ export function loadAiSettings(): AiSettings {
       claude_code: (rawAccess as Record<string, unknown>).claude_code === "thirdparty" ? "thirdparty" : "direct",
       codex_runtime: (rawAccess as Record<string, unknown>).codex_runtime === "thirdparty" ? "thirdparty" : "direct",
     };
+    const rawAgentPaths = stored.agentPaths && typeof stored.agentPaths === "object" ? stored.agentPaths : {};
+    const agentPaths = Object.fromEntries(([
+      "claude_code", "codex_runtime",
+    ] as AgentRuntimeId[]).flatMap((runtime) => {
+      const value = (rawAgentPaths as Record<string, unknown>)[runtime];
+      return typeof value === "string" && value.trim() ? [[runtime, value.trim()]] : [];
+    })) as Partial<Record<AgentRuntimeId, string>>;
     const rawThirdParty = stored.agentThirdParty && typeof stored.agentThirdParty === "object" ? stored.agentThirdParty : {};
     const agentThirdParty = Object.fromEntries(([
       "claude_code", "codex_runtime",
@@ -219,6 +233,7 @@ export function loadAiSettings(): AiSettings {
       ...storedSettings,
       agentRuntime,
       agentAccess,
+      agentPaths,
       agentThirdParty,
       provider,
       defaultModel,
@@ -240,7 +255,15 @@ export function resolveAiModel(settings: AiSettings, feature?: AiFeature): strin
 }
 
 export function resolveAiModelConfig(settings: AiSettings, feature?: AiFeature): AiModelConfig {
-  return (feature && settings.featureModels[feature]) || defaultAiModelConfig(settings);
+  const featureConfig = feature && settings.featureModels[feature];
+  // A feature override from another provider must not survive a switch of the
+  // default service. Otherwise changing to DeepSeek still sends some features
+  // to a stale OpenAI-compatible endpoint. Same-provider overrides remain valid.
+  const sameService = featureConfig
+    && featureConfig.provider === settings.provider
+    && featureConfig.baseUrl.trim().replace(/\/+$/, "") === settings.baseUrl.trim().replace(/\/+$/, "");
+  if (sameService) return featureConfig;
+  return defaultAiModelConfig(settings);
 }
 
 export function saveAiSettings(settings: AiSettings): void {
@@ -497,6 +520,24 @@ function responseText(value: unknown): string {
   }).join("").trim();
 }
 
+function nonReasoningFallbackModel(config: AiModelConfig, feature?: AiFeature): string | undefined {
+  if (!/reasoner|reasoning|thinking/i.test(config.model)) return undefined;
+  if (config.provider === "deepseek" || /deepseek\.com/i.test(config.baseUrl)) {
+    return config.availableModels.find((model) => /flash|pro/i.test(model) && !/reasoner|reasoning|thinking/i.test(model)) || "deepseek-flash";
+  }
+  // Translation and other short-form features should not fall back to a
+  // model that spends the whole output budget on hidden reasoning.
+  if (feature === "translation" && config.provider === "openai") return "gpt-4.1-mini";
+  return undefined;
+}
+
+function translationRetryModel(config: AiModelConfig, feature?: AiFeature): string | undefined {
+  if (feature !== "translation" || !(/deepseek\.com/i.test(config.baseUrl) || config.provider === "deepseek")) return undefined;
+  return config.availableModels.find((model) => /flash/i.test(model) && model !== config.model)
+    || config.availableModels.find((model) => /pro/i.test(model) && model !== config.model)
+    || "deepseek-flash";
+}
+
 async function requestText(
   settings: AiSettings,
   messages: ChatMessage[],
@@ -508,9 +549,18 @@ async function requestText(
   const system = baseSystemContext(settings, feature);
   const contextualizedMessages = contextualizeMessages(messages, normalizedContext);
   const config = await resolveReadyAiModel(settings, feature);
-  const reasoningEffort = resolvedReasoningEffort(config);
-  const maxOutputTokens = Math.max(256, Math.min(8192, options.maxOutputTokens || 2048));
+  const fallbackModel = nonReasoningFallbackModel(config, feature);
+  const retryModel = fallbackModel || translationRetryModel(config, feature);
+  const requestModel = options.modelOverride || (feature === "translation" && fallbackModel ? fallbackModel : config.model);
+  const reasoningEffort = options.disableReasoning || requestModel !== config.model ? undefined : resolvedReasoningEffort(config);
+  const maxOutputTokens = options.omitMaxOutputTokens ? undefined : Math.max(256, Math.min(8192, options.maxOutputTokens || 2048));
   const temperature = Math.max(0, Math.min(1, options.temperature ?? 0.25));
+  const retryWithoutReasoning = () => requestText(settings, messages, context, feature, {
+    ...options,
+    disableReasoning: true,
+    modelOverride: retryModel || options.modelOverride,
+    ...(options.omitMaxOutputTokens ? {} : { maxOutputTokens: Math.min(8192, Math.max((maxOutputTokens || 2048) * 2, 4096)) }),
+  });
   if (config.provider === "anthropic") {
     const sessionMessageCount = normalizedContext.session ? 1 : 0;
     const cachedPrefixBoundary = options.cachePrefixMessages
@@ -521,8 +571,8 @@ async function requestText(
       "x-api-key": config.apiKey,
       "anthropic-version": "2023-06-01",
     }, {
-      model: config.model,
-      max_tokens: maxOutputTokens,
+      model: requestModel,
+      ...(maxOutputTokens ? { max_tokens: maxOutputTokens } : {}),
       temperature,
       ...(reasoningEffort ? { output_config: { effort: reasoningEffort } } : {}),
       system,
@@ -538,22 +588,24 @@ async function requestText(
       })),
     }) as { content?: Array<{ type?: string; text?: string }> };
     const content = payload.content?.find((item) => item.type === "text")?.text;
+    if (!content && !options.disableReasoning) return retryWithoutReasoning();
     if (!content) throw new Error("模型没有返回文本内容。");
     return content;
   }
 
   if (config.provider === "gemini") {
-    const url = `${endpoint(config.baseUrl, `/models/${encodeURIComponent(config.model)}:generateContent`)}?key=${encodeURIComponent(config.apiKey)}`;
+    const url = `${endpoint(config.baseUrl, `/models/${encodeURIComponent(requestModel)}:generateContent`)}?key=${encodeURIComponent(config.apiKey)}`;
     const payload = await postJson(url, { "Content-Type": "application/json" }, {
       systemInstruction: { parts: [{ text: system }] },
       generationConfig: {
         temperature,
-        maxOutputTokens,
+        ...(maxOutputTokens ? { maxOutputTokens } : {}),
         ...(reasoningEffort ? { thinkingConfig: { thinkingLevel: reasoningEffort.toUpperCase() } } : {}),
       },
       contents: contextualizedMessages.map(({ role, content }) => ({ role: role === "assistant" ? "model" : "user", parts: [{ text: content }] })),
     }) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
     const content = payload.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("").trim();
+    if (!content && !options.disableReasoning) return retryWithoutReasoning();
     if (!content) throw new Error("模型没有返回文本内容。");
     return content;
   }
@@ -562,10 +614,11 @@ async function requestText(
     "Content-Type": "application/json",
     ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
   }, {
-    model: config.model,
+    model: requestModel,
     temperature,
-    max_tokens: maxOutputTokens,
+    ...(maxOutputTokens ? { max_tokens: maxOutputTokens } : {}),
     ...(reasoningEffort ? { reasoning_effort: reasoningEffort === "max" ? "high" : reasoningEffort } : {}),
+    ...((options.disableReasoning || (feature === "translation" && /deepseek-r1|reasoner|thinking/i.test(config.model))) && config.provider === "ollama" ? { think: false } : {}),
     ...(config.provider === "openai" && options.cacheAffinityKey
       ? { prompt_cache_key: options.cacheAffinityKey }
       : {}),
@@ -585,17 +638,22 @@ async function requestText(
   };
   const choice = payload.choices?.[0];
   const content = responseText(choice?.message?.content) || responseText(choice?.text);
-  if (content && options.jsonResponse && choice?.finish_reason === "length") {
-    throw new Error("模型输出达到长度上限，结构化结果不完整。请减少检查范围或更换上下文更大的模型。");
+  if (content && choice?.finish_reason === "length") {
+    if (!options.disableReasoning) return retryWithoutReasoning();
+    if (options.jsonResponse) throw new Error("模型输出达到长度上限，结构化结果不完整。请减少检查范围或更换上下文更大的模型。");
   }
   if (content) return content;
 
   const reasoning = responseText(choice?.message?.reasoning_content);
   if (options.jsonResponse && reasoning && /[\[{]/.test(reasoning)) return reasoning;
   if (choice?.finish_reason === "length") {
+    if (!options.disableReasoning) return retryWithoutReasoning();
     throw new Error("模型推理达到输出上限，尚未生成最终结果。请重试或选择非推理模型。");
   }
-  if (reasoning) throw new Error("模型只返回了推理过程，没有生成最终结果。请重试或选择非推理模型。");
+  if (reasoning) {
+    if (!options.disableReasoning) return retryWithoutReasoning();
+    throw new Error("模型只返回了推理过程，没有生成最终结果。请重试或选择非推理模型。");
+  }
   if (!choice) throw new Error("模型响应中没有可用的候选结果。");
   throw new Error("模型没有返回文本内容。");
 }

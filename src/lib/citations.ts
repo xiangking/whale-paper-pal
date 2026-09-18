@@ -412,7 +412,7 @@ const HOST_INTERVALS: Record<string, number> = {
   "api.semanticscholar.org": 1100,
   "api.openalex.org": 150,
   "api.crossref.org": 250,
-  "www.themoonlight.io": 250,
+  "api.themoonlight.io": 250,
 };
 
 type CachedResponse = { body: string; storedAt: number; expiresAt: number };
@@ -642,7 +642,7 @@ function moonlightCitation(documentId: string, paper: MoonlightScholarPaper, ind
 }
 
 async function loadMoonlightBundle(request: OnlineCitationMetadataRequest): Promise<{ references: CitationCard[]; citations: CitationCard[] } | null> {
-  const url = `https://www.themoonlight.io/api/scholar/anonymous/search-with-ref?query=${encodeURIComponent(request.title)}`;
+  const url = `https://api.themoonlight.io/api/scholar/anonymous/search-with-ref?query=${encodeURIComponent(request.title)}`;
   const bundle = await getJson<MoonlightScholarBundle>(url);
   if (!bundle.semanticScholarPaper || titleSimilarity(request.title, bundle.semanticScholarPaper.title || "") < 0.72) return null;
   return {

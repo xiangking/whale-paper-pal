@@ -180,6 +180,12 @@ export function SettingsDialog({ open, settings, focusSection = "general", onClo
   const semanticScholarInputRef = useRef<HTMLInputElement>(null);
   const petSpriteInputRef = useRef<HTMLInputElement>(null);
 
+  const refreshAgentRuntimes = (refresh = false) => {
+    void getAgentRuntimeStatus({ paths: draft.agentPaths, refresh })
+      .then(setAgentRuntimes)
+      .catch(() => setAgentRuntimes([]));
+  };
+
   useEffect(() => {
     setConnection({ kind: "idle", message: "" });
     setModelDiscovery({ kind: "idle", message: "" });
@@ -245,7 +251,7 @@ export function SettingsDialog({ open, settings, focusSection = "general", onClo
 
   useEffect(() => {
     if (!open || activeTab !== "runtime") return;
-    void getAgentRuntimeStatus().then(setAgentRuntimes).catch(() => setAgentRuntimes([]));
+    refreshAgentRuntimes();
   }, [activeTab, open]);
 
   if (!open) return null;
@@ -272,6 +278,12 @@ export function SettingsDialog({ open, settings, focusSection = "general", onClo
         : current.agentThirdParty || {},
     }));
   };
+  const setAgentPath = (runtime: AgentRuntimeId, value: string) => {
+    setDraft((current) => ({
+      ...current,
+      agentPaths: { ...(current.agentPaths || {}), [runtime]: value },
+    }));
+  };
   const setAgentThirdPartyField = (runtime: AgentRuntimeId, field: "baseUrl" | "apiKey" | "model", value: string) => {
     setDraft((current) => ({
       ...current,
@@ -287,7 +299,7 @@ export function SettingsDialog({ open, settings, focusSection = "general", onClo
   const loadAgentModels = async (runtime: AgentRuntimeId, accessMode: AgentAccessMode, thirdParty: AiSettings["agentThirdParty"][AgentRuntimeId]) => {
     setAgentModelState((current) => ({ ...current, [runtime]: { ...current[runtime], kind: "loading", message: "正在获取模型…" } }));
     try {
-      const models = await getAgentModelList(runtime, { accessMode, thirdParty });
+      const models = await getAgentModelList(runtime, { accessMode, thirdParty, cliPath: draft.agentPaths?.[runtime] });
       setAgentModelState((current) => ({ ...current, [runtime]: { kind: "success", models, message: `已获取 ${models.length} 个模型` } }));
       if (accessMode === "thirdparty") {
         setDraft((current) => {
@@ -524,7 +536,7 @@ export function SettingsDialog({ open, settings, focusSection = "general", onClo
                       <div className="settings-feature-model-row" key={field.key}>
                         <span><strong>{field.label}</strong><small>{field.description}</small></span>
                         <button type="button" onClick={() => setEditingFeature(field.key)}>
-                          <span>{config ? `${providerPreset(config.provider).label} · ${config.model}` : `使用默认模型 · ${draft.defaultModel || "尚未设置"}`}</span>
+                          <span>{config && config.provider === draft.provider && config.baseUrl.replace(/\/+$/, "") === draft.baseUrl.replace(/\/+$/, "") ? `${providerPreset(config.provider).label} · ${config.model}` : config ? `旧配置已停用 · 使用默认模型 · ${draft.defaultModel || "尚未设置"}` : `使用默认模型 · ${draft.defaultModel || "尚未设置"}`}</span>
                           <ChevronRight size={15} />
                         </button>
                       </div>
@@ -564,7 +576,8 @@ export function SettingsDialog({ open, settings, focusSection = "general", onClo
                       const accessMode = draft.agentAccess?.[runtime] || "direct";
                       const thirdParty = draft.agentThirdParty?.[runtime] || { baseUrl: AGENT_RUNTIME_DEFAULTS[runtime].baseUrl, apiKey: "", model: AGENT_RUNTIME_DEFAULTS[runtime].model, models: [] };
                       const modelState = agentModelState[runtime];
-                      const thirdPartyConfigured = Boolean(thirdParty.baseUrl.trim() && thirdParty.model.trim());
+                      const savedThirdParty = draft.agentThirdParty?.[runtime];
+                      const thirdPartyConfigured = Boolean(savedThirdParty?.baseUrl.trim() && savedThirdParty?.model.trim());
                       const directAuthenticated = item.authenticated === true;
                       const runtimeReady = item.available && (accessMode === "thirdparty" || directAuthenticated);
                       return <article key={runtime} className={`settings-runtime-card ${runtimeReady ? "is-ready" : "is-missing"}`}>
@@ -577,7 +590,8 @@ export function SettingsDialog({ open, settings, focusSection = "general", onClo
                           <button type="button" className={accessMode === "direct" ? "is-active" : ""} aria-pressed={accessMode === "direct"} onClick={() => setAgentAccessMode(runtime, "direct")}><strong>直连</strong><small>使用本机登录和 Runtime 配置</small></button>
                           <button type="button" className={accessMode === "thirdparty" ? "is-active" : ""} aria-pressed={accessMode === "thirdparty"} onClick={() => setAgentAccessMode(runtime, "thirdparty")}><strong>第三方</strong><small>{AGENT_RUNTIME_DEFAULTS[runtime].description}</small></button>
                         </div>
-                        {accessMode === "direct" ? <div className="settings-runtime-direct-note"><span>模型、账号与认证由本机 {item.label} 管理；模型列表从对应 Runtime 动态获取。</span><button type="button" className="settings-runtime-models-button" disabled={!item.available || modelState.kind === "loading"} onClick={() => void loadAgentModels(runtime, accessMode, thirdParty)}><RefreshCw className={modelState.kind === "loading" ? "is-spinning" : ""} size={13} />获取模型</button>{modelState.message && <small className={`settings-runtime-models-message is-${modelState.kind}`}>{modelState.message}</small>}</div> : <div className="settings-runtime-thirdparty">
+                        <div className="settings-runtime-cli-config"><label className="settings-runtime-cli-path"><span>CLI 地址</span><input value={draft.agentPaths?.[runtime] || ""} onChange={(event) => setAgentPath(runtime, event.target.value)} placeholder="自动检测，可手动填写" spellCheck={false} /></label><button type="button" className="settings-runtime-models-button" onClick={() => refreshAgentRuntimes(true)}><RefreshCw size={13} />检测</button>{item.path && <small className="settings-runtime-path" title={item.path}>已使用：{item.path}</small>}</div>
+                        {accessMode === "direct" ? <div className="settings-runtime-direct-note"><span>直连使用本机 {item.label} 的登录和配置。指定地址无效时会自动搜索系统路径。</span><button type="button" className="settings-runtime-models-button" disabled={!item.available || modelState.kind === "loading"} onClick={() => void loadAgentModels(runtime, accessMode, thirdParty)}><RefreshCw className={modelState.kind === "loading" ? "is-spinning" : ""} size={13} />获取模型</button>{modelState.message && <small className={`settings-runtime-models-message is-${modelState.kind}`}>{modelState.message}</small>}</div> : <div className="settings-runtime-thirdparty">
                           <label><span>API 地址</span><input value={thirdParty.baseUrl} onChange={(event) => setAgentThirdPartyField(runtime, "baseUrl", event.target.value)} placeholder={AGENT_RUNTIME_DEFAULTS[runtime].baseUrl} spellCheck={false} /></label>
                           <label><span>API Key（可选）</span><input type="password" value={thirdParty.apiKey} onChange={(event) => setAgentThirdPartyField(runtime, "apiKey", event.target.value)} placeholder={runtime === "claude_code" ? "sk-ant-..." : "sk-..."} autoComplete="off" spellCheck={false} /></label>
                           <label><span>模型</span><div className="settings-runtime-model-input"><input value={thirdParty.model} onChange={(event) => setAgentThirdPartyField(runtime, "model", event.target.value)} placeholder={AGENT_RUNTIME_DEFAULTS[runtime].model} list={`${runtime}-thirdparty-models`} spellCheck={false} /><button type="button" className="settings-runtime-models-button" disabled={!thirdParty.baseUrl.trim() || modelState.kind === "loading"} onClick={() => void loadAgentModels(runtime, accessMode, thirdParty)}><RefreshCw className={modelState.kind === "loading" ? "is-spinning" : ""} size={13} />获取</button></div><datalist id={`${runtime}-thirdparty-models`}>{Array.from(new Set([...(thirdParty.models || []), ...(modelState.models || []).map((item) => item.id), ...draft.availableModels])).map((model) => <option key={model} value={model} />)}</datalist>{modelState.message && <small className={`settings-runtime-models-message is-${modelState.kind}`}>{modelState.message}</small>}</label>
@@ -586,7 +600,7 @@ export function SettingsDialog({ open, settings, focusSection = "general", onClo
                       </article>;
                     })}
                   </div>
-                  <button className="secondary-button settings-runtime-refresh" type="button" onClick={() => void getAgentRuntimeStatus().then(setAgentRuntimes).catch(() => setAgentRuntimes([]))}><RefreshCw size={15} />重新检测</button>
+                  <button className="secondary-button settings-runtime-refresh" type="button" onClick={() => refreshAgentRuntimes(true)}><RefreshCw size={15} />重新检测</button>
                 </section>
               </div>
             )}
@@ -682,7 +696,7 @@ export function SettingsDialog({ open, settings, focusSection = "general", onClo
                     <div className="settings-feature-model-row">
                       <span><strong>桌宠对话</strong><small>用于论文问答、研究思路和学术写作交流</small></span>
                       <button type="button" onClick={() => setEditingFeature("desktopPet")}>
-                        <span>{draft.featureModels.desktopPet ? `${providerPreset(draft.featureModels.desktopPet.provider).label} · ${draft.featureModels.desktopPet.model}` : `使用默认模型 · ${draft.defaultModel || "尚未设置"}`}</span>
+                        <span>{draft.featureModels.desktopPet && draft.featureModels.desktopPet.provider === draft.provider && draft.featureModels.desktopPet.baseUrl.replace(/\/+$/, "") === draft.baseUrl.replace(/\/+$/, "") ? `${providerPreset(draft.featureModels.desktopPet.provider).label} · ${draft.featureModels.desktopPet.model}` : draft.featureModels.desktopPet ? `旧配置已停用 · 使用默认模型 · ${draft.defaultModel || "尚未设置"}` : `使用默认模型 · ${draft.defaultModel || "尚未设置"}`}</span>
                         <ChevronRight size={15} />
                       </button>
                     </div>

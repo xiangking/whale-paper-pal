@@ -104,6 +104,7 @@ export type AiFeature = "review" | "chat" | "desktopPet" | "explain" | "translat
 export type AiReasoningEffort = "auto" | "low" | "medium" | "high" | "max";
 export type AgentRuntimeId = "claude_code" | "codex_runtime";
 export type AgentAccessMode = "direct" | "thirdparty";
+export type AgentPaths = Partial<Record<AgentRuntimeId, string>>;
 export type AgentThirdPartyConfig = {
   baseUrl: string;
   apiKey: string;
@@ -156,6 +157,8 @@ export type DesktopPetTtsSettings = {
 export type AiSettings = {
   agentRuntime: AgentRuntimeId;
   agentAccess: Record<AgentRuntimeId, AgentAccessMode>;
+  /** Optional local CLI paths. Empty values use automatic discovery. */
+  agentPaths: AgentPaths;
   agentThirdParty: Partial<Record<AgentRuntimeId, AgentThirdPartyConfig>>;
   provider: AiProvider;
   baseUrl: string;
@@ -229,7 +232,7 @@ export type PaperReviewPoint = {
   suggestion?: string;
 };
 
-export type PaperReview = {
+export type LegacyPaperReview = {
   executiveSummary: string;
   paperType: string;
   researchQuestion: string;
@@ -242,6 +245,14 @@ export type PaperReview = {
   literaturePositioning: string;
   takeaways: string[];
 };
+
+export type MarkdownPaperReview = {
+  overviewMarkdown: string;
+  methodMarkdown: string;
+  analysisMarkdown: string;
+};
+
+export type PaperReview = LegacyPaperReview | MarkdownPaperReview;
 
 export type PaperInsights = {
   review: PaperReview | null;
@@ -319,6 +330,7 @@ export type QuizSession = {
 
 export type PageTranslation = {
   pageNumber: number;
+  layoutVersion?: number;
   sourceLanguage: string;
   targetLanguage: string;
   content: string;
@@ -330,11 +342,34 @@ export type TextRange = { start: number; end: number };
 
 export type TranslationSegment = {
   id: string;
+  kind?: "text" | "figure-caption" | "table" | "formula" | "footnote";
+  sourceBlockId?: string;
+  sourceBlockIds?: string[];
   sourceText: string;
   sourceRange: TextRange;
   targetText: string;
   targetRange: TextRange;
   rects?: AnnotationRect[];
+};
+
+export type PdfVisualRegion = AnnotationRect & {
+  kind: "image" | "table" | "formula";
+};
+
+export type PdfTextBlock = {
+  id: string;
+  pageNumber: number;
+  text: string;
+  rects: AnnotationRect[];
+  order: number;
+  /** Visual column assigned by the layout parser (0 for single-column pages). */
+  column?: number;
+  /** Heuristic confidence for the inferred block boundary/order. */
+  confidence?: number;
+  /** Structural blocks are translated independently from body paragraphs. */
+  kind?: NonNullable<TranslationSegment["kind"]>;
+  /** Source lines retain geometry so text inside figures/tables can be omitted. */
+  lines?: Array<{ text: string; rect: AnnotationRect }>;
 };
 
 export type AutoHighlight = {

@@ -4,6 +4,7 @@ import {
   BookOpen,
   ChevronLeft,
   Moon,
+  RefreshCw,
   Settings,
   Star,
   Sun,
@@ -21,9 +22,7 @@ function sidebarMaxWidth(panel: HTMLElement): number {
 }
 
 function paperHref(paper: DiscoveryPaper): string {
-  return paper.pdfUrl
-    ? `https://www.themoonlight.io/file?url=${encodeURIComponent(paper.pdfUrl)}`
-    : paper.url;
+  return paper.pdfUrl || paper.url;
 }
 
 function paperYear(paper: DiscoveryPaper): string {
@@ -67,6 +66,8 @@ export function DiscoverySidebar(props: DiscoverySidebarProps) {
   });
   const [related, setRelated] = useState<DiscoveryPaper[]>([]);
   const [relatedState, setRelatedState] = useState<LoadingState>("loading");
+  const [relatedError, setRelatedError] = useState("");
+  const [relatedReload, setRelatedReload] = useState(0);
 
   const currentEntry = props.entries.find((entry) => entry.id === props.document.id);
   const savedIds = useMemo(() => new Set(props.entries.map((entry) => entry.id)), [props.entries]);
@@ -75,17 +76,19 @@ export function DiscoverySidebar(props: DiscoverySidebarProps) {
   useEffect(() => {
     let cancelled = false;
     setRelated([]);
+    setRelatedError("");
     setRelatedState("loading");
     void loadRelatedPapers(props.document.title, props.semanticScholarApiKey).then((papers) => {
       if (cancelled) return;
       setRelated(papers);
       setRelatedState("ready");
-    }).catch(() => {
+    }).catch((error) => {
       if (cancelled) return;
+      setRelatedError(error instanceof Error ? error.message : "论文推荐服务暂时不可用");
       setRelatedState("error");
     });
     return () => { cancelled = true; };
-  }, [props.document.id, props.document.title, props.semanticScholarApiKey]);
+  }, [props.document.id, props.document.title, props.semanticScholarApiKey, relatedReload]);
 
   return (
     <aside ref={sidebarResize.panelRef} className="app-sidebar discovery-sidebar" style={sidebarResize.panelStyle}>
@@ -106,8 +109,8 @@ export function DiscoverySidebar(props: DiscoverySidebarProps) {
         <header className="discovery-inline-header"><h2>相关论文</h2><span>{related.length ? `${related.length} 篇` : "当前论文延伸阅读"}</span></header>
         <div className="discovery-results">
           {relatedState === "loading" && <DiscoverySkeleton />}
-          {relatedState === "error" && <div className="discovery-empty">暂时无法加载相关论文。</div>}
-          {relatedState === "ready" && !related.length && <div className="discovery-empty">暂未找到与当前论文相关的内容。</div>}
+          {relatedState === "error" && <div className="discovery-empty discovery-empty-action"><span>{relatedError}</span><button type="button" onClick={() => setRelatedReload((value) => value + 1)}><RefreshCw size={13} />重新获取</button></div>}
+          {relatedState === "ready" && !related.length && <div className="discovery-empty discovery-empty-action"><span>暂未找到与当前论文相关的内容。</span><button type="button" onClick={() => setRelatedReload((value) => value + 1)}><RefreshCw size={13} />重新获取</button></div>}
           {related.map((paper) => {
             const saved = savedIds.has(discoveryLibraryId(paper));
             return (

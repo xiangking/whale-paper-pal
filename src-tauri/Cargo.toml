@@ -15,7 +15,6 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-ort = { version = "=2.0.0-rc.13", features = ["coreml"] }
 regex = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.10"
@@ -30,3 +29,12 @@ tauri-plugin-fs = "2"
 tauri-plugin-opener = "2"
 wait-timeout = "0.2"
 xz2 = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.13", features = ["coreml"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "api-27", "load-dynamic"] }
+
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+ort = { version = "=2.0.0-rc.13" }

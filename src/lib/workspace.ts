@@ -7,6 +7,8 @@ const STORAGE_KEY = READER_WORKSPACE_KEY;
 function readPaperReview(value: unknown): PaperReview | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const source = value as Record<string, unknown>;
+  const markdownSections = ["overviewMarkdown", "methodMarkdown", "analysisMarkdown"];
+  if (markdownSections.every((key) => typeof source[key] === "string")) return source as PaperReview;
   const requiredStrings = ["executiveSummary", "paperType", "researchQuestion", "methodologySummary", "experimentalEvidence", "reproducibility", "literaturePositioning"];
   const requiredArrays = ["contributions", "strengths", "weaknesses", "takeaways"];
   if (!requiredStrings.every((key) => typeof source[key] === "string") || !requiredArrays.every((key) => Array.isArray(source[key]))) return null;
